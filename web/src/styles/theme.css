@@ -1,0 +1,200 @@
+/* 视觉取自 printfilm（调研 §11 的原生数值），保留我们的青柠强调色。
+   Element Plus 通过 CSS 变量覆盖，避免逐组件覆写。 */
+:root {
+  --lime: #b6ff00;
+  --ink: #111318;
+  --muted: #6b7280;
+  --bg: #f7f8fa;
+  --card: #fff;
+  --line: rgba(17, 19, 24, 0.1);
+  --hover: #f4fbe0;
+  --ok: #3d6500;
+  --warn: #8a5a12;
+  --bad: #a1261a;
+  --run: #2f6fd0;
+  --radius: 14px;
+  --radius-sm: 10px;
+  --shadow: 0 8px 28px rgba(17, 19, 24, 0.06);
+  --nav-h: 64px;
+
+  /* Element Plus 主题对齐 */
+  --el-color-primary: #111318;
+  --el-color-success: #3d6500;
+  --el-color-warning: #8a5a12;
+  --el-color-danger: #a1261a;
+  --el-border-radius-base: 8px;
+  --el-font-size-base: 13px;
+  --el-text-color-primary: #111318;
+  --el-text-color-regular: #374151;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #app { height: 100%; margin: 0; }
+
+body {
+  font-family: 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', system-ui, -apple-system, sans-serif;
+  font-size: 13px;
+  color: var(--ink);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 数字一律等宽对齐，表格里跳动会很明显 */
+.tabular, .num, td.num, .segbar { font-variant-numeric: tabular-nums; }
+
+/* 统一焦点环（可访问性）。用变量是为了 DRY —— 测试断言也会跟着变量走 */
+:root { --focus: 0 0 0 3px color-mix(in srgb, var(--lime) 28%, transparent); }
+:focus-visible {
+  outline: none;
+  border-color: color-mix(in srgb, var(--lime) 70%, var(--ink));
+  box-shadow: var(--focus);
+}
+
+.dim { color: var(--muted); }
+.small { font-size: 11.5px; }
+.spacer { flex: 1; }
+
+/* ---------- 四栏工作台 ---------- */
+/* 栏宽取自 printfilm 的分集台（drama.css:4173-4185），与我们的信息结构同构。
+   7 列表格必须在 1fr 主栏：固定列合计 442px + 弹性列 52%，300px 栏塞不下。 */
+.workbench {
+  display: grid;
+  grid-template-columns: 168px 300px minmax(0, 1fr) 420px;
+  gap: 10px;
+  padding: 10px;
+  height: calc(100vh - var(--nav-h) - 150px);
+  min-height: 420px;
+}
+.col {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+.colhead {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 11px;
+  border-bottom: 1px solid var(--line);
+  font-weight: 600;
+  font-size: 12.5px;
+  flex: 0 0 auto;
+}
+.colbody { overflow: auto; padding: 8px; flex: 1 1 auto; min-height: 0; }
+
+/* ---------- 胶片条 ---------- */
+.filmbar {
+  background: var(--card);
+  border-top: 1px solid var(--line);
+  padding: 6px 12px 10px;
+}
+.fshead { display: flex; align-items: center; gap: 10px; font-size: 11.5px; color: var(--muted); }
+.filmstrip {
+  display: flex; gap: 8px; overflow-x: auto; padding: 6px 0;
+  scroll-snap-type: x proximity; align-items: flex-start;
+  /* 缩略图多时要能横向滚但不撑破页面 */
+  scrollbar-width: thin;
+}
+.fs-item {
+  flex: 0 0 auto; width: 96px; border: 1px solid var(--line); border-radius: 8px;
+  background: #fbfbfc; padding: 3px; cursor: pointer; scroll-snap-align: start;
+  transition: border-color .12s ease, box-shadow .12s ease;
+}
+.fs-item:hover { border-color: #c5d4a4; }
+.fs-item.is-active { border-color: var(--lime); box-shadow: 0 0 0 2px color-mix(in srgb, var(--lime) 35%, transparent); }
+.fs-item img, .fs-item .ph { width: 100%; height: 54px; object-fit: cover; border-radius: 5px; display: block; background: #eef0f3; }
+.fs-item .ph { display: flex; align-items: center; justify-content: center; font-size: 10.5px; color: var(--muted); }
+.fs-cap { font-size: 10px; color: var(--muted); margin-top: 2px; display: flex; gap: 3px; align-items: center; }
+
+/* ---------- 分段播放器 ---------- */
+/* 每段 flex ∝ 该镜 sec_actual。既是进度条、又是时长分布、又是导航。 */
+.segbar {
+  display: flex; gap: 2px; width: 100%; height: 26px; align-items: stretch;
+  background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 2px; overflow: hidden;
+}
+.seg { flex: 0 0 auto; min-width: 3px; border-radius: 4px; background: #6b7280; cursor: pointer; position: relative; transition: filter .15s ease; }
+.seg:hover { filter: brightness(1.25); }
+.seg.ok { background: var(--ok); }
+.seg.warn { background: var(--warn); }
+.seg.bad { background: var(--bad); }
+.seg.now { outline: 2px solid var(--lime); outline-offset: 1px; }
+.seglegend { display: flex; gap: 12px; align-items: center; margin-top: 6px; }
+.seglegend .sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+.seglegend .sw.ok { background: var(--ok); }
+.seglegend .sw.warn { background: var(--warn); }
+.seglegend .sw.bad { background: var(--bad); }
+
+/* ---------- 状态三色 ---------- */
+.tone-ok { color: var(--ok); }
+.tone-warn { color: var(--warn); }
+.tone-bad { color: var(--bad); }
+.tone-run { color: var(--run); }
+.tone-idle { color: var(--muted); }
+
+.shotstatus { display: flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 600; }
+.shotstatus .ck {
+  width: 16px; height: 16px; border-radius: 50%; background: var(--lime); color: #243300;
+  display: inline-flex; align-items: center; justify-content: center; font-size: 11px;
+}
+
+/* ---------- 场景 / 道具卡 ---------- */
+.scard { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 9px 10px; margin-bottom: 8px; }
+.shead { display: flex; align-items: center; gap: 7px; font-size: 13px; }
+.shead code { font-size: 10.5px; color: var(--muted); }
+.smeta { margin-top: 3px; }
+.sdesc { margin-top: 6px; font-size: 12px; line-height: 1.55; color: #374151; }
+.hintline { margin-top: 6px; font-size: 11px; color: var(--muted); line-height: 1.5; }
+
+/* ---------- 表格 ---------- */
+table.shots { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 12px; }
+table.shots thead th {
+  position: sticky; top: 0; z-index: 2; background: #fbfbfc; text-align: left;
+  font-weight: 600; font-size: 11.5px; color: var(--muted);
+  padding: 7px 8px; border-bottom: 1px solid var(--line);
+}
+table.shots tbody td { padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+table.shots tbody tr:hover { background: var(--hover); }
+table.shots tbody tr.is-active { background: var(--hover); box-shadow: inset 3px 0 0 var(--lime); }
+.thumb { position: relative; width: 100%; aspect-ratio: 16/9; border-radius: 6px; overflow: hidden; background: #eef0f3; }
+.thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+/* ① 缩略图格子里直接写字：缺什么就写在画面格，而不是留白 */
+.thumb.empty, .thumb.rendering, .thumb.failed {
+  display: flex; align-items: center; justify-content: center; font-size: 11px; color: var(--muted);
+}
+.thumb.empty { font-size: 11.5px; }
+.thumb .badge { position: absolute; right: 3px; top: 3px; font-size: 9.5px; padding: 0 4px; border-radius: 4px; }
+.thumbcap { margin-top: 3px; font-size: 10.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.scene { font-size: 11.5px; }
+.scene small { display: block; color: var(--muted); font-size: 10px; }
+.cell-edit {
+  appearance: none; display: block; width: 100%; text-align: left; border: 1px solid transparent;
+  background: transparent; padding: 4px 6px; margin: -4px -6px; border-radius: 8px;
+  font: inherit; cursor: pointer; color: inherit;
+}
+.cell-edit:hover { border-color: #c5d4a4; background: var(--hover); }
+.cell-edit .line { color: #4b5563; font-size: 12px; line-height: 1.5; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.cell-edit .title { font-size: 12px; line-height: 1.5; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+
+/* ---------- 空态 ---------- */
+.emptyrow { color: var(--muted); font-size: 12px; line-height: 1.7; padding: 14px 6px; }
+
+/* ---------- 骨架屏 ---------- */
+.skel { display: flex; gap: 6px; padding: 6px 2px; }
+.skel i {
+  height: 12px; flex: 1; border-radius: 4px;
+  background: linear-gradient(90deg, #eef0f3 25%, #f7f8fa 50%, #eef0f3 75%);
+  background-size: 200% 100%; animation: skel 1.2s ease-in-out infinite;
+}
+@keyframes skel { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+
+/* 横向滚动条细一点，四栏里不抢视线 */
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-thumb { background: #d6dae0; border-radius: 5px; }
+::-webkit-scrollbar-thumb:hover { background: #c2c8d0; }
+::-webkit-scrollbar-track { background: transparent; }

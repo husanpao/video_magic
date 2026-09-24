@@ -1,0 +1,18 @@
+[Unit]
+Description=NiliX AI comic-drama workbench (headless HTTP 8787)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/max/nilix
+ExecStart=/home/max/nilix/nilix -bind 0.0.0.0 -port 8787 -config settings.json -kb /home/max/nilix/zhishiku
+Restart=always
+RestartSec=3
+TimeoutStopSec=30
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nilix
+
+[Install]
+WantedBy=default.target
