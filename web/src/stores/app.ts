@@ -1,5 +1,7 @@
 import { computed, reactive, readonly } from 'vue'
+import { ElMessage } from 'element-plus'
 import { api, ApiError } from '@/api/client'
+import { confirmAction } from '@/composables/confirmAction'
 import type {
   AuditResponse, CharRow, ProjectSummary, PropRow, QcResponse, SceneRow,
   AssetRow, ChapterRow, CompletenessResponse, EpisodeInfo, QueueResponse, ScriptChapter, ShotKind, ShotRow, StageReadiness, StatusResponse, StoryboardRow,
@@ -29,6 +31,22 @@ export const FILTERS: Array<[string, string]> = [
 export const STAGES = ['plan', 'chars', 'render', 'qc', 'assemble', 'all'] as const
 export const STAGE_CN: Record<string, string> = {
   plan: '拆镜', chars: '定妆', render: '渲染', qc: '质检', assemble: '合成', all: '全链',
+}
+
+/** 全局撤销/重做栈的一条记录（U4）。
+ *
+ *  为什么把逆操作做成**闭包**而不是指望后端多级撤销：后端 `api.undo` 只有一步
+ *  （shots/*.json.bak 单级备份，见 taskctl._backup_file），前端必须自己记账才谈得上"栈"。
+ *  每个 mutation 落地时把自己的**逆操作**（undo）与**正操作**（redo）一起交进来 ——
+ *  字段类编辑（保存/锁定/重写）用编辑接口互逆，天然多级、可重做；
+ *  结构类编辑（拆/合/插/删）也用编辑接口互逆（insert 支持显式 id，能把删掉的镜头原样放回）。
+ */
+export interface EditEntry {
+  /** 「保存 1-2-03」这种人话标签，顶栏撤销按钮上会显示 */
+  label: string
+  undo: () => Promise<unknown>
+  /** 可安全重放的正操作；没有它「重做」按钮对这条记录禁用 */
+  redo?: () => Promise<unknown>
 }
 
 export interface State {
@@ -66,6 +84,15 @@ export interface State {
   logText: string
   busy: boolean
   error: string
+  /** 多选集合（批量操作栏的数据源，U1）。与单选 `selected` 是两回事。 */
+  checked: string[]
+  /** 乐观「生成中」标记：id → 提交渲染的时刻(ms)。见 markRendering / kindOf。 */
+  renderHint: Record<string, number>
+  /** 全局撤销 / 重做栈（U4） */
+  undoStack: EditEntry[]
+  redoStack: EditEntry[]
+  /** 撤销/重做成功后自增 —— 详情弹层等监听它重载自身内容 */
+  historyRev: number
 }
 
 export const state = reactive<State>({
@@ -79,7 +106,39 @@ export const state = reactive<State>({
   chapters: [], chapter: null, scripts: [], completeness: null, assets: [], queue: null,
   qc: { results: {}, counts: { pass: 0, suspicious: 0 }, review: [], rerender: [], has_result: false, generated_at: 0 },
   audit: null, logText: '', busy: false, error: '',
+  checked: [], renderHint: {}, undoStack: [], redoStack: [], historyRev: 0,
 })
+
+/* ---------------- 统一错误 / 加载通道（U3 / B6） ----------------
+ *
+ * 之前 `state.error` 只写不读（grep 可证）—— 网络抖动、首拉失败时界面"看起来没事"。
+ * 现在约定：**所有** refresh* 都走 guard()：
+ *   · 失败 → 统一回落（保留上一次的数据）+ 写 state.error，由 App.vue 的全局错误条显示；
+ *   · 同通道恢复成功 → 自动清掉自己那条错误（否则一次抖动会让错误条挂到天荒地老）。
+ */
+export function setError(msg: string): void {
+  const m = (msg || '').trim()
+  if (m && state.error !== m) state.error = m
+}
+
+export function clearError(): void {
+  state.error = ''
+}
+
+export function errText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e)
+}
+
+async function guard(channel: string, fn: () => Promise<void>): Promise<void> {
+  try {
+    await fn()
+    // 同通道的旧错误在恢复成功后自清（error 格式固定为「通道：详情」）
+    if (state.error.startsWith(`${channel}：`)) state.error = ''
+  } catch (e) {
+    // 回落 = 上一次的数据原样留在界面上，这里只负责让失败**可见**
+    setError(`${channel}：${errText(e)}`)
+  }
+}
 
 /** 派生镜头档。
  *
@@ -91,6 +150,10 @@ export const state = reactive<State>({
  *  ai-drama-generator 就是所有卡片共享一个 `isPending`，点一镜全表转圈。
  */
 export function kindOf(s: ShotRow): AnyKind {
+  // 乐观「生成中」：渲染刚提交、任务还没被轮询到的那几秒先自己显示（U2）。
+  // 产物是新的（mtime 晚于提交时刻）就说明这轮已经出片，别再挡着派生结论。
+  const hinted = state.renderHint[s.id]
+  if (hinted && (!s.clip || !s.clip.exists || s.clip.mtime * 1000 < hinted)) return 'rendering'
   if (state.running && state.task) {
     if (state.task.shot && state.task.shot === s.id) return 'rendering'
     if ((state.task.only || []).includes(s.id) && !(s.clip && s.clip.exists)) return 'rendering'
@@ -209,28 +272,232 @@ export function opsFor(s: ShotRow) {
   }
 }
 
-/** 置位 E1 标记并就地更新状态（不整表重拉）。 */
+/* ---------------- 多选（U1） ---------------- */
+
+export function isChecked(id: string): boolean {
+  return state.checked.includes(id)
+}
+
+/** 翻转一镜的多选状态。`on` 给定时直接置位（全选/复选框受控渲染用）。 */
+export function toggleChecked(id: string, on?: boolean): void {
+  const has = state.checked.includes(id)
+  const want = on ?? !has
+  if (want === has) return
+  state.checked = want ? [...state.checked, id] : state.checked.filter((x) => x !== id)
+}
+
+/** 「全选当前筛选」的三态判断：可见行全选中 = 可一键取消。 */
+export const allVisibleChecked = computed(() =>
+  visibleShots.value.length > 0 && visibleShots.value.every((s) => state.checked.includes(s.id)),
+)
+
+export function toggleCheckAllVisible(): void {
+  state.checked = allVisibleChecked.value ? [] : visibleShots.value.map((s) => s.id)
+}
+
+/* ---------------- 乐观「生成中」标记（U2） ---------------- */
+
+/** 渲染提交后**本地先标生成中** —— 后端任务起来前的几秒里表格不能毫无反应
+ *  （旧行为：等下一轮 4s 轮询才出现「生成中」，用户以为没点上）。
+ *  记录提交时刻：产物 mtime 晚于它 = 这轮已出片，标记自动失效。 */
+export function markRendering(ids: string[]): void {
+  const now = Date.now()
+  const next = { ...state.renderHint }
+  for (const id of ids) next[id] = now
+  state.renderHint = next
+}
+
+/** 清理失效的乐观标记：出片了 / 消失了 / 超时（兜底，防任务卡死时永远「生成中」）。 */
+function pruneRenderHints(rows: ShotRow[]): void {
+  const keys = Object.keys(state.renderHint)
+  if (!keys.length) return
+  const now = Date.now()
+  const next = { ...state.renderHint }
+  let dirty = false
+  for (const id of keys) {
+    const at = next[id]
+    const s = rows.find((r) => r.id === id)
+    if (!s || now - at > 120_000 || (s.clip && s.clip.exists && s.clip.mtime * 1000 >= at)) {
+      delete next[id]
+      dirty = true
+    }
+  }
+  if (dirty) state.renderHint = next
+}
+
+/** 任务结束（或切项目）后整批清掉 —— 没有任务就没有"生成中"。 */
+export function clearRenderHints(): void {
+  state.renderHint = {}
+}
+
+/* ---------------- 全局撤销 / 重做（U4） ---------------- */
+
+const HISTORY_CAP = 100
+
+export function pushEdit(entry: EditEntry): void {
+  state.undoStack.push(entry)
+  if (state.undoStack.length > HISTORY_CAP) state.undoStack.shift()
+  // 标准语义：新操作让「重做」失效（重做栈里的操作已经不在"当前"的延长线上）
+  state.redoStack = []
+}
+
+export const canUndo = computed(() => state.undoStack.length > 0)
+export const canRedo = computed(() => state.redoStack.length > 0)
+export const undoLabel = computed(() => state.undoStack[state.undoStack.length - 1]?.label || '')
+export const redoLabel = computed(() => state.redoStack[state.redoStack.length - 1]?.label || '')
+
+/** 撤销栈顶操作。**永不抛出**（快捷键里是 fire-and-forget 调用）；
+ *  逆操作失败要把条目放回栈顶 —— 不放回去这一操作就"既没撤销也找不回"了。 */
+export async function undoEdit(): Promise<void> {
+  const e = state.undoStack.pop()
+  if (!e) {
+    ElMessage.info('没有可撤销的操作')
+    return
+  }
+  try {
+    await e.undo()
+    state.redoStack.push(e)
+    state.historyRev++
+    ElMessage.success(`已撤销：${e.label}`)
+    await refreshAfterEdit()
+  } catch (err) {
+    state.undoStack.push(e)
+    setError(`撤销失败：${errText(err)}`)
+    ElMessage.error(`撤销失败：${errText(err)}`)
+  }
+}
+
+/** 重做栈顶操作。与 undoEdit 对称。 */
+export async function redoEdit(): Promise<void> {
+  const e = state.redoStack.pop()
+  if (!e) {
+    ElMessage.info('没有可重做的操作')
+    return
+  }
+  if (!e.redo) {
+    state.redoStack.push(e)
+    ElMessage.warning(`「${e.label}」没有可安全重放的正操作`)
+    return
+  }
+  try {
+    await e.redo()
+    state.undoStack.push(e)
+    state.historyRev++
+    ElMessage.success(`已重做：${e.label}`)
+    await refreshAfterEdit()
+  } catch (err) {
+    state.redoStack.push(e)
+    setError(`重做失败：${errText(err)}`)
+    ElMessage.error(`重做失败：${errText(err)}`)
+  }
+}
+
+/** 切项目 / 清空重置时把**会串项目**的瞬态全清掉：
+ *  多选（旧 id 对不上新表）、撤销栈（逆操作指向旧项目）、乐观标记、错误条。 */
+export function clearTransient(): void {
+  state.checked = []
+  state.undoStack = []
+  state.redoStack = []
+  state.renderHint = {}
+  state.error = ''
+}
+
+/* ---------------- mutation 出口 ---------------- */
+
+/** 置位 E1 标记并就地更新状态（不整表重拉）。
+ *  `locked` 会进撤销栈（锁定/解锁是可回滚的资产操作）。 */
 export async function setFlag(id: string, flag: 'locked' | 'selected' | 'favorite', value: boolean) {
   state.busy = true
   try {
     const r = await api.lockShot(state.project, id, flag, value)
-    const s = state.shots.find((x) => x.id === id)
-    if (s && (flag === 'locked' || flag === 'selected')) s[flag] = r[flag]
+    syncFlag(id, flag, r[flag])
+    if (flag === 'locked') {
+      const apply = async (v: boolean) => {
+        const rr = await api.lockShot(state.project, id, 'locked', v)
+        syncFlag(id, 'locked', rr.locked)
+      }
+      pushEdit({
+        label: `${value ? '锁定' : '解锁'} ${id}`,
+        undo: () => apply(!value),
+        redo: () => apply(value),
+      })
+    }
     return r
   } finally {
     state.busy = false
   }
 }
 
-export async function loadProjects() {
-  const r = await api.projects()
-  state.projects = r.projects
-  if (!state.project) state.project = r.default || (r.projects[0]?.name ?? '')
+function syncFlag(id: string, flag: 'locked' | 'selected' | 'favorite', value: boolean): void {
+  const s = state.shots.find((x) => x.id === id)
+  if (s && (flag === 'locked' || flag === 'selected')) s[flag] = value
 }
 
-export async function refreshStatus(silent = false) {
-  if (!state.project) return
+/** 快捷键 L：切换选中镜的锁定。 */
+export async function toggleLockShot(s: ShotRow): Promise<void> {
   try {
+    const r = await setFlag(s.id, 'locked', !s.locked)
+    ElMessage.success(r.message || (r.locked ? `已锁定 ${s.id}` : `已解锁 ${s.id}`))
+  } catch (e) {
+    ElMessage.error(`锁定失败：${errText(e)}`)
+  }
+}
+
+/** 渲染提交的公共出口（单镜 / 表格按钮 / 弹层 / 快捷键 R 共用）。
+ *  提交后**本地先标「生成中」**（markRendering），不用等下一轮轮询。 */
+export async function submitRerender(id: string): Promise<void> {
+  if (!state.project || !id) return
+  const r = await api.run(state.project, 'render', { force: true, only: [id] })
+  markRendering([id])
+  ElMessage.success(r.message || `已开始重渲 ${id}`)
+  window.setTimeout(() => { void refreshStatus() }, 300)
+}
+
+/** 单镜渲染 / 重渲（带统一确认）。
+ *  ⚠️ 后端 `/api/rerender` 只收单镜；这里用与之完全等价的
+ *  `_start({stage:'render'}, only=[shot], force=True)`，并保留「弹确认」的习惯动作。 */
+export async function rerenderOne(s: ShotRow): Promise<void> {
+  if (state.running) {
+    ElMessage.warning('有任务在跑，先等它结束（同项目同时只允许一个任务）')
+    return
+  }
+  const has = !!(s.clip && s.clip.exists)
+  const ok = await confirmAction({
+    title: has ? '强制重渲' : '渲染',
+    message: has
+      ? `强制重渲镜头 ${s.id}？会用当前提示词重新生成并替换这一版。`
+      : `按当前提示词渲染镜头 ${s.id}？`,
+    confirmText: has ? '重渲' : '渲染',
+  })
+  if (!ok) return
+  try {
+    await submitRerender(s.id)
+  } catch (e) {
+    ElMessage.error(`重渲失败：${errText(e)}`)
+  }
+}
+
+/** 写后即刷（U2 / B4）：镜头编辑成功后**立即**刷新镜头表与章计数。
+ *  以前拆分/合并/插入/保存只重载弹层自身，App 空闲时不轮询镜头表 →
+ *  表格长时间显示旧数据，用户以为没生效。 */
+export async function refreshAfterEdit(): Promise<void> {
+  await refreshShots()
+  await refreshChapters()
+}
+
+/* ---------------- 拉取（全部走 guard：失败统一回落 + 界面报错） ---------------- */
+
+export async function loadProjects(): Promise<void> {
+  await guard('项目列表', async () => {
+    const r = await api.projects()
+    state.projects = r.projects
+    if (!state.project) state.project = r.default || (r.projects[0]?.name ?? '')
+  })
+}
+
+export async function refreshStatus(): Promise<void> {
+  if (!state.project) return
+  await guard('状态', async () => {
     const st = await api.status(state.project)
     state.task = st.task || {}
     state.progress = st.progress || state.progress
@@ -238,86 +505,97 @@ export async function refreshStatus(silent = false) {
     state.final = st.final ?? null
     state.finals = st.finals ?? []
     state.running = !!st.running
-    if (!silent) state.error = ''
-  } catch (e) {
-    if (!silent) state.error = (e as Error).message
-  }
+  })
 }
 
 export async function refreshShots(): Promise<void> {
   if (!state.project) return
-  const r = await api.shots(state.project)
-  state.shots = r.shots
-  state.counts = r.counts
-  state.shotsLoaded = true
+  await guard('镜头表', async () => {
+    const r = await api.shots(state.project)
+    state.shots = r.shots
+    state.counts = r.counts
+    state.shotsLoaded = true
+    // 表变了，顺手把失效的乐观标记 / 已删镜的选中清掉（不然复选框勾着一行不存在的镜）
+    pruneRenderHints(r.shots)
+    const alive = new Set(r.shots.map((s) => s.id))
+    if (state.checked.some((id) => !alive.has(id))) state.checked = state.checked.filter((id) => alive.has(id))
+    if (state.selected && !alive.has(state.selected)) state.selected = ''
+  })
 }
 
 let logOffset = 0
-export async function pullLog() {
+export async function pullLog(): Promise<void> {
   if (!state.project) return
-  const r = await api.log(state.project, logOffset)
-  if (r.reset) {
-    state.logText = ''
-    logOffset = 0
-  }
-  if (r.text) state.logText += r.text
-  logOffset = r.next
-  if (state.logText.length > 400_000) state.logText = state.logText.slice(-200_000)
-  return r.reset
+  await guard('日志', async () => {
+    const r = await api.log(state.project, logOffset)
+    if (r.reset) {
+      state.logText = ''
+      logOffset = 0
+    }
+    if (r.text) state.logText += r.text
+    logOffset = r.next
+    if (state.logText.length > 400_000) state.logText = state.logText.slice(-200_000)
+  })
 }
 
-export async function refreshQc() {
+export async function refreshQc(): Promise<void> {
   if (!state.project) return
-  const r = await api.qc(state.project)
-  state.qc = {
-    results: r.results, counts: r.counts, review: r.review, rerender: r.rerender,
-    has_result: r.has_result, generated_at: r.generated_at,
-  }
+  await guard('质检', async () => {
+    const r = await api.qc(state.project)
+    state.qc = {
+      results: r.results, counts: r.counts, review: r.review, rerender: r.rerender,
+      has_result: r.has_result, generated_at: r.generated_at,
+    }
+  })
 }
 
-export async function refreshAudit() {
+export async function refreshAudit(): Promise<void> {
   if (!state.project) return
-  state.audit = await api.audit(state.project)
+  await guard('审计', async () => {
+    state.audit = await api.audit(state.project)
+  })
 }
 
-export async function refreshChars() {
+export async function refreshChars(): Promise<void> {
   if (!state.project) return
-  const r = await api.chars(state.project)
-  state.chars = r.chars
+  await guard('角色', async () => {
+    const r = await api.chars(state.project)
+    state.chars = r.chars
+  })
 }
 
-export async function refreshScenes() {
+export async function refreshScenes(): Promise<void> {
   if (!state.project) return
-  const r = await api.scenes(state.project)
-  state.scenes = r.scenes
-  state.scenesAssigned = r.assigned
-  state.scenesTotal = r.total_shots
+  await guard('场景', async () => {
+    const r = await api.scenes(state.project)
+    state.scenes = r.scenes
+    state.scenesAssigned = r.assigned
+    state.scenesTotal = r.total_shots
+  })
 }
 
-export async function refreshProps() {
+export async function refreshProps(): Promise<void> {
   if (!state.project) return
-  const r = await api.props(state.project)
-  state.props = r.props
-  state.propsShotsWith = r.shots_with_props ?? 0
+  await guard('道具', async () => {
+    const r = await api.props(state.project)
+    state.props = r.props
+    state.propsShotsWith = r.shots_with_props ?? 0
+  })
 }
 
-export async function refreshQueue() {
+export async function refreshQueue(): Promise<void> {
   if (!state.project) return
-  try {
+  await guard('队列', async () => {
     state.queue = await api.queue(state.project)
-  } catch {
-    state.queue = null
-  }
+  })
 }
 
-export async function refreshAssets() {
+export async function refreshAssets(): Promise<void> {
   if (!state.project) return
-  try {
+  await guard('素材', async () => {
     const r = await api.assets(state.project)
     state.assets = r.assets || []
-  } catch {
-    state.assets = []
-  }
+  })
 }
 
 /** 某个场景/道具的候选（没出过图就返回空数组）。 */
@@ -325,29 +603,27 @@ export function assetOf(kind: 'scene' | 'prop', id: string): AssetRow | undefine
   return state.assets.find((a) => a.kind === kind && a.id === id)
 }
 
-export async function refreshCompleteness() {
+export async function refreshCompleteness(): Promise<void> {
   if (!state.project) return
-  try {
+  await guard('完备性', async () => {
     state.completeness = await api.completeness(state.project)
-  } catch {
-    state.completeness = null
-  }
+  })
 }
 
-export async function refreshScript() {
+export async function refreshScript(): Promise<void> {
   if (!state.project) return
-  try {
+  await guard('剧本', async () => {
     const r = await api.script(state.project)
     state.scripts = r.chapters || []
-  } catch {
-    state.scripts = []
-  }
+  })
 }
 
-export async function refreshChapters() {
+export async function refreshChapters(): Promise<void> {
   if (!state.project) return
-  const r = await api.chapters(state.project)
-  state.chapters = r.chapters || []
+  await guard('章列表', async () => {
+    const r = await api.chapters(state.project)
+    state.chapters = r.chapters || []
+  })
 }
 
 /** 镜头属于第几章 —— 从 **id 首段**取（`2-1-03` → 2）。
@@ -365,11 +641,27 @@ export const storyboardById = computed(() => {
   return m
 })
 
-export async function refreshStoryboard() {
+export async function refreshStoryboard(): Promise<void> {
   if (!state.project) return
-  const r = await api.storyboard(state.project)
-  state.storyboard = r.shots || []
-  state.storyboardModel = r.model || null
+  await guard('分镜图', async () => {
+    const r = await api.storyboard(state.project)
+    state.storyboard = r.shots || []
+    state.storyboardModel = r.model || null
+  })
+}
+
+/** 全量补刷（任务刚结束 / 清空重置后调一次）。
+ *  各 tab 有自己的去重，重复调用很便宜。 */
+export async function refreshAll(): Promise<void> {
+  await refreshShots()
+  await refreshChapters()
+  await refreshScenes()
+  await refreshScript()
+  await refreshStoryboard()
+  await refreshAssets()
+  await refreshQc()
+  await refreshAudit()
+  await refreshChars()
 }
 
 export { readonly, ApiError }

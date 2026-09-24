@@ -1,14 +1,21 @@
 <!--
-  顶栏：项目选择 + 阶段按钮 + 进度 + 停止。
+  顶栏：项目选择 + 阶段 stepper + 进度 + 撤销/重做 + 停止 + 清空重置。
   逐条对应旧 vm/static/index.html 的：
     · <header class="topbar"> 标记 + <div id="warn" class="banner">（第 288-303 行）
     · renderStageButtons()（676-689）· refreshStatus() 里顶栏那一段（611-647）
     · runStage()（690-701）· $('stop').onclick（702-710）
   进度条改用一个真实数字 + Element Plus 不确定态：
   旧文件在没有 total 时把 5% 画成宽度（假百分比），这里没有真实进度就用 indeterminate。
+
+  本版改动（U7 / U4）：
+  · 6 个孤立按钮 → **阶段 stepper**：一眼看到流水线走到哪一步、卡在缺什么
+  （readiness 的 per-stage 缺失信息直接挂在步进节点的 title 上），
+  运行中当前阶段高亮并挂**真实** done/total（不造假百分比）。
+  · 常驻「撤销 / 重做」按钮 + 顶栏右侧 `?` 快捷键帮助（useHotkeys 的自述表）。
 -->
 <template>
   <ResetDialog v-model="showReset" ref="resetDlg" />
+  <SettingsDialog v-model="settingsOpen" :project="state.project" />
   <header class="topbar">
     <h1>漫剧<span>流水线</span></h1>
 
@@ -29,20 +36,50 @@
 
     <span class="pill" :class="pill.cls">{{ pill.text }}</span>
 
-    <span class="stages">
-      <button
-        v-for="s in STAGES"
-        :key="s"
-        :class="{ primary: s === 'all' }"
-        :disabled="stageDisabled(s)"
-        :title="stageTitle(s)"
-        @click="runStage(s)"
-      >
-        {{ stageLabel(s) }}
-      </button>
+    <!-- 阶段 stepper（U7）。每一步都可点（= 旧的阶段按钮），未就绪的挂 ⚠ 与原因 title。 -->
+    <span class="stepper" data-testid="stage-stepper">
+      <template v-for="(st, i) in steps" :key="st.stage">
+        <span v-if="i" class="steplink" :class="{ done: st.linkDone }" />
+        <button
+          class="step"
+          :class="{ active: st.active, warn: st.warn }"
+          :disabled="stageDisabled(st.stage)"
+          :title="stageTitle(st.stage)"
+          @click="runStage(st.stage)"
+        >
+          <span class="stepno tabular">{{ st.no }}</span>
+          <span class="steplabel">{{ st.label }}</span>
+          <span v-if="st.warn" class="stepwarn">⚠</span>
+          <span v-if="st.progText" class="stepprog tabular">{{ st.progText }}</span>
+        </button>
+      </template>
     </span>
+    <button
+      class="stages-all"
+      :disabled="stageDisabled('all')"
+      :title="stageTitle('all')"
+      @click="runStage('all')"
+    >全链</button>
 
     <span class="spacer" />
+
+    <!-- 全局撤销 / 重做（U4）。常驻 —— 删除提示里那句「可点顶部撤销」终于有地方可点了。 -->
+    <span class="histbtns">
+      <button
+        class="undobtn"
+        data-testid="btn-undo"
+        :disabled="!canUndo"
+        :title="canUndo ? `撤销：${undoLabel}（Ctrl+Z）` : '没有可撤销的操作（Ctrl+Z）'"
+        @click="onUndo"
+      >↶ 撤销</button>
+      <button
+        class="undobtn"
+        data-testid="btn-redo"
+        :disabled="!canRedo"
+        :title="canRedo ? `重做：${redoLabel}（Ctrl+Shift+Z）` : '没有可重做的操作（Ctrl+Shift+Z）'"
+        @click="onRedo"
+      >↷ 重做</button>
+    </span>
 
     <span class="pillbox">
       <span class="tabular" title="镜头派生状态汇总">{{ countsText }}</span>
@@ -86,6 +123,16 @@
     >
       清空重置
     </button>
+
+    <!-- 设置入口（Lead 集成接线）：打开 SettingsDialog —— 全部后台硬编码配置的用户入口 -->
+    <button
+      class="setbtn"
+      data-testid="btn-settings"
+      title="设置（连接/渲染/模型/字幕/预算/风格——全部配置）"
+      @click.stop="settingsOpen = true"
+    >⚙ 设置</button>
+
+    <button class="helpbtn" title="快捷键帮助（?）" @click="helpOpen = !helpOpen">?</button>
   </header>
 
   <div v-if="missingModules.length" class="banner">{{ bannerText }}</div>
@@ -97,11 +144,19 @@ import { ElCheckbox, ElMessage, ElMessageBox, ElOption, ElProgress, ElSelect } f
 import ResetDialog from '@/components/ResetDialog.vue'
 import { api, ApiError } from '@/api/client'
 import type { Stage } from '@/api/types'
-import { kindCounts, refreshStatus, STAGE_CN, STAGES, state } from '@/stores/app'
+import {
+  canRedo, canUndo, kindCounts, redoEdit, redoLabel, refreshStatus,
+  STAGE_CN, STAGES, state, undoEdit, undoLabel,
+} from '@/stores/app'
+import { helpOpen } from '@/composables/useHotkeys'
+import { confirmAction } from '@/composables/confirmAction'
+import SettingsDialog from '@/components/SettingsDialog.vue'
 
 /** 「强制重跑」/「试运行」两个开关：旧文件是 #force / #dry 两个 checkbox，语义直接对应 api.run 的 force/dry。 */
 const force = ref(false)
 const dry = ref(false)
+/** 设置面板显隐（T4，Lead 集成接线）。 */
+const settingsOpen = ref(false)
 
 /* ---------------- 任务 pill ---------------- */
 // 旧 refreshStatus()：运行中 · 阶段 / 已停止 (rc=) / 结束 (rc=) / 空闲
@@ -113,15 +168,13 @@ const pill = computed<{ cls: string; text: string }>(() => {
   return { cls: '', text: '空闲' }
 })
 
-/* ---------------- 阶段按钮（旧 renderStageButtons） ---------------- */
+/* ---------------- 阶段 stepper（旧 renderStageButtons → U7） ---------------- */
+/** stepper 的 5 个真实阶段（`all` 是「全链」按钮，不算一步）。 */
+const STEPS: Stage[] = ['plan', 'chars', 'render', 'qc', 'assemble']
+
 function stageReady(s: Stage): boolean {
   const r = state.readiness[s]
   return !r || r.ready
-}
-
-function stageLabel(s: Stage): string {
-  // 旧文件：textContent = STAGE_CN[s]（all 也是「全链」），未就绪再补一个 ⚠
-  return STAGE_CN[s] + (stageReady(s) ? '' : ' ⚠')
 }
 
 function stageTitle(s: Stage): string {
@@ -139,8 +192,28 @@ function stageDisabled(s: Stage): boolean {
   return state.running || !stageReady(s)
 }
 
-/* ---------------- 进度（旧 refreshStatus 的 progw/bar/barText） ---------------- */
-/** 有真实分母才算"真实进度"；没有分母又没在跑就什么都不画（不假造百分比）。 */
+/** stepper 节点派生值：序号 / 未就绪⚠ / 当前阶段高亮 / 真实 done/total。
+ *  ★ done/total 只挂在**当前阶段**上，且必须有真实分母 —— 没有就什么都不显示
+ *  （不造假百分比，这是老文件踩过的坑）。 */
+const steps = computed(() =>
+  STEPS.map((s, i) => {
+    const running = state.running && (state.task.stage === s || state.progress.stage === s)
+    const total = state.progress.total
+    return {
+      stage: s,
+      no: i + 1,
+      label: STAGE_CN[s],
+      warn: !stageReady(s),
+      active: running,
+      progText: running && total > 0 ? `${state.progress.done}/${total}` : '',
+      // 连接线：当前阶段之前的段落视为"已走完"
+      linkDone: state.running
+        ? STEPS.findIndex((x) => x === state.task.stage || x === state.progress.stage) >= i
+        : false,
+    }
+  }),
+)
+
 const hasRealProgress = computed(() => state.progress.total > 0)
 const pct = computed(() => (hasRealProgress.value ? state.progress.pct : 0))
 
@@ -185,9 +258,16 @@ const bannerText = computed(
 )
 
 /* ---------------- 动作（旧 runStage / #stop.onclick） ---------------- */
+/**
+ * 启动阶段：**点了就跑**，不再弹前置确认。
+ *
+ * 为什么去掉原来那句 window.confirm：启动阶段不是破坏性操作（渲染有检查点、编辑可撤销），
+ * 真正的刹车点在 E3 预算护栏 —— 超预算时它会弹「已花多少 / 卡在哪 / 再放行多少」等人批。
+ * 每次跑阶段前都问一句"确定吗"，问到最后只会闭眼点确定；确认只留给**不可逆**动作
+ * （停止 / 删除 / 清空重置，见 confirmAction 的用武之地）。
+ */
 async function runStage(s: Stage): Promise<void> {
   if (!state.project) return
-  if (!window.confirm(`对项目「${state.project}」启动阶段：${STAGE_CN[s]}？`)) return
   await launch(s, false)
 }
 
@@ -205,7 +285,7 @@ async function launch(s: Stage, approved: boolean): Promise<void> {
     const r = await api.run(state.project, s, { force: force.value, dry: dry.value })
     ElMessage.success(r.message || `已启动：${state.project} / ${STAGE_CN[s]}`)
     state.tab = 'log' // 旧文件跑完阶段自动切到「日志」tab
-    window.setTimeout(() => { void refreshStatus(true) }, 300)
+    window.setTimeout(() => { void refreshStatus() }, 300)
   } catch (e) {
     const err = e as ApiError
     if (err.needsApproval && !approved) {
@@ -251,15 +331,26 @@ async function launch(s: Stage, approved: boolean): Promise<void> {
 
 async function stopTask(): Promise<void> {
   if (!state.project) return
-  if (!window.confirm(`停止项目「${state.project}」当前任务？（只对记录的精确 pid 发 SIGTERM）`)) return
+  // 停止会打断正在跑的任务 —— 用统一确认（U10），不再 window.confirm
+  const ok = await confirmAction({
+    title: '停止任务',
+    message: `停止项目「${state.project}」当前任务？（只对记录的精确 pid 发 SIGTERM，已渲染完的片段会保留）`,
+    confirmText: '停止',
+    danger: true,
+  })
+  if (!ok) return
   try {
     const r = await api.stop(state.project)
     ElMessage.success(r.message || '已发送停止信号')
-    window.setTimeout(() => { void refreshStatus(true) }, 500)
+    window.setTimeout(() => { void refreshStatus() }, 500)
   } catch (e) {
     ElMessage.error(`停止失败：${(e as Error).message}`)
   }
 }
+
+/* ---------------- 全局撤销 / 重做（U4） ---------------- */
+async function onUndo(): Promise<void> { await undoEdit() }
+async function onRedo(): Promise<void> { await redoEdit() }
 
 const showReset = ref(false)
 const resetDlg = ref<InstanceType<typeof ResetDialog> | null>(null)
@@ -280,49 +371,93 @@ async function openReset() {
   background: var(--card); border-bottom: 1px solid var(--line);
 }
 .topbar h1 { margin: 0; font-size: 15px; font-weight: 600; }
-.topbar h1 span { color: #7bb500; }
+.topbar h1 span { color: var(--lime-deep); }
 .projsel { width: 190px; }
 
-.stages { display: flex; gap: 6px; flex-wrap: wrap; }
-.stages button {
+/* ---- 阶段 stepper（U7） ---- */
+.stepper { display: flex; align-items: center; gap: 0; flex-wrap: wrap; }
+.steplink {
+  width: 14px; height: 2px; background: var(--line); flex: 0 0 auto;
+}
+.steplink.done { background: color-mix(in srgb, var(--lime) 70%, var(--ink)); }
+.step {
+  display: inline-flex; align-items: center; gap: 5px;
   font: inherit; font-size: 12px; padding: 4px 9px; cursor: pointer;
-  background: var(--card); border: 1px solid var(--line); border-radius: var(--radius-sm);
+  background: var(--card); border: 1px solid var(--line); border-radius: 999px;
+  color: inherit;
 }
-.stages button:hover:not(:disabled) { border-color: color-mix(in srgb, var(--lime) 70%, var(--ink)); }
-.stages button.primary {
-  background: var(--lime); border-color: color-mix(in srgb, var(--lime) 70%, var(--ink)); font-weight: 600;
+.step:hover:not(:disabled) { border-color: color-mix(in srgb, var(--lime) 70%, var(--ink)); }
+.step:disabled { opacity: 0.55; cursor: not-allowed; }
+.step .stepno {
+  width: 15px; height: 15px; border-radius: 50%; flex: 0 0 auto;
+  background: var(--hover); color: var(--muted);
+  display: inline-flex; align-items: center; justify-content: center; font-size: 10px;
 }
-.stages button:disabled { opacity: 0.45; cursor: not-allowed; }
+.step.active {
+  border-color: color-mix(in srgb, var(--lime) 70%, var(--ink));
+  background: var(--hover); font-weight: 600;
+}
+.step.active .stepno { background: var(--lime); color: var(--ink); }
+.step.warn .stepwarn { color: var(--warn); font-size: 11px; }
+.step .stepprog { color: var(--run); font-size: 11px; }
+.stages-all {
+  font: inherit; font-size: 12px; padding: 4px 11px; cursor: pointer; font-weight: 600;
+  background: var(--lime); border: 1px solid color-mix(in srgb, var(--lime) 70%, var(--ink));
+  border-radius: 999px; color: inherit;
+}
+.stages-all:disabled { opacity: 0.45; cursor: not-allowed; }
 
-.pill { padding: 2px 10px; border-radius: 999px; font-size: 12px; border: 1px solid var(--line); background: #eef0f3; }
-.pill.run { background: #e8f1fd; color: var(--run); border-color: #bcd6f7; }
-.pill.ok { background: #eef7d8; color: var(--ok); border-color: #cfe4a4; }
-.pill.stop { background: #fdeceb; color: var(--bad); border-color: #eec2bf; }
+/* ---- 撤销 / 重做 ---- */
+.histbtns { display: flex; gap: 4px; }
+.undobtn {
+  font: inherit; font-size: 11.5px; padding: 4px 8px; cursor: pointer;
+  background: var(--card); border: 1px solid var(--line); border-radius: var(--radius-sm); color: inherit;
+}
+.undobtn:hover:not(:disabled) { border-color: color-mix(in srgb, var(--lime) 70%, var(--ink)); }
+.undobtn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.pill { padding: 2px 10px; border-radius: 999px; font-size: 12px; border: 1px solid var(--line); background: var(--surface-3); }
+.pill.run { background: var(--run-bg); color: var(--run); border-color: var(--run-border); }
+.pill.ok { background: var(--ok-bg); color: var(--ok); border-color: var(--ok-border); }
+.pill.stop { background: var(--bad-bg); color: var(--bad); border-color: var(--bad-border); }
 
 .pillbox {
   display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
 .progw { width: 150px; display: inline-block; }
-.idletrack { height: 8px; background: #e8eaee; border-radius: 999px; }
+.idletrack { height: 8px; background: var(--track); border-radius: 999px; }
 .pillbox :deep(.el-progress) { width: 150px; }
-.pillbox :deep(.el-progress-bar__outer) { background: #e8eaee; }
-.pillbox :deep(.el-progress-bar__inner) { background: linear-gradient(90deg, #8fd000, var(--lime)); }
+.pillbox :deep(.el-progress-bar__outer) { background: var(--track); }
+.pillbox :deep(.el-progress-bar__inner) { background: linear-gradient(90deg, var(--lime-deep), var(--lime)); }
 
 .stopbtn {
   font: inherit; font-size: 12px; padding: 4px 10px; cursor: pointer; border-radius: var(--radius-sm);
-  background: #fff; border: 1px solid #e3b4b0; color: var(--bad);
+  background: var(--card); border: 1px solid var(--bad-border); color: var(--bad);
 }
 .stopbtn:disabled { opacity: 0.45; cursor: not-allowed; }
 
 .banner {
   margin: 0; padding: 7px 14px; font-size: 12px;
-  background: #fdf3e2; border-bottom: 1px solid #f0d9ae; color: var(--warn);
+  background: var(--warn-bg); border-bottom: 1px solid var(--warn-border); color: var(--warn);
 }
 .resetbtn {
   font: inherit; font-size: 11.5px; padding: 5px 11px; border-radius: 8px; cursor: pointer;
   border: 1px solid color-mix(in srgb, var(--bad) 45%, var(--line));
   background: transparent; color: var(--bad); font-weight: 600;
 }
-.resetbtn:hover { background: #fdeceb; border-color: var(--bad); }
+.resetbtn:hover { background: var(--bad-bg); border-color: var(--bad); }
+
+/* 设置入口（T4 预留位）：中性样式，等接线后不需要再调 */
+.setbtn {
+  font: inherit; font-size: 11.5px; padding: 5px 10px; border-radius: 8px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--card); color: var(--ink);
+}
+.setbtn:hover { border-color: color-mix(in srgb, var(--lime) 70%, var(--ink)); }
+
+.helpbtn {
+  font: inherit; font-size: 12px; width: 26px; height: 26px; padding: 0; cursor: pointer;
+  border-radius: 50%; border: 1px solid var(--line); background: var(--card); color: var(--muted);
+}
+.helpbtn:hover { color: var(--ink); border-color: color-mix(in srgb, var(--lime) 70%, var(--ink)); }
 </style>

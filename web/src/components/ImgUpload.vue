@@ -69,7 +69,7 @@ async function onFile(e: Event) {
   border: 1px dashed color-mix(in srgb, var(--lime) 60%, var(--line));
   background: transparent; color: var(--ink);
 }
-.upbtn:hover:not(:disabled) { border-style: solid; background: #f2f8e8; }
+.upbtn:hover:not(:disabled) { border-style: solid; background: var(--lime-pale); }
 .upbtn:disabled { opacity: .5; cursor: not-allowed; }
 .upfile {
   /* 必须**视觉隐藏但不能 display:none** —— display:none 的 input 在某些浏览器

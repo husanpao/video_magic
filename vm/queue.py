@@ -22,10 +22,13 @@ queue.py —— 项目级作业队列。
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
+import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -80,6 +83,40 @@ def _path(proj) -> Path:
     return Path(proj.state_dir) / QUEUE_FILENAME
 
 
+# ── 并发保护 ────────────────────────────────────────────────────────────────
+# 为什么必须加锁：queue.json 的每次改写都是「读整个文件 → 改 → 整个写回」，
+# 而写它的一边是 **Web 的多个请求线程**、另一边是 **drainer 独立进程** ——
+# 不上锁时两边的读改写会互相覆盖：丢作业、状态回退（诊断 B3，grep 证实全文无锁）。
+# 两层锁缺一不可（与 taskctl._project_lock 同一模式）：
+#   · threading.Lock —— 同进程内多请求线程互斥（Web 是 ThreadingHTTPServer）
+#   · fcntl.flock    —— 跨进程互斥（drainer 是独立 worker 进程）
+# 为什么自建而不用 taskctl 的 task.lock：队列的读改写发生在**任务运行期间**
+# （drainer 正跑作业时 Web 还要能入队/取消），不能蹭任务启动的互斥语义 ——
+# 那会把入队拖进"同项目只允许一个任务"的锁里。锁文件独立：state/queue.lock。
+
+_QUEUE_LOCKS: dict[str, threading.Lock] = {}
+_QUEUE_LOCKS_GUARD = threading.Lock()
+
+
+@contextmanager
+def _queue_lock(proj):
+    """queue.json 读改写的临界区。所有**写**路径必须包在里面。"""
+    p = _path(proj)
+    with _QUEUE_LOCKS_GUARD:
+        tlock = _QUEUE_LOCKS.setdefault(str(p), threading.Lock())
+    with tlock:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        lf = open(p.with_suffix(".lock"), "a+")
+        try:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+            finally:
+                lf.close()
+
+
 def read_all(proj) -> list[Job]:
     p = _path(proj)
     if not p.is_file():
@@ -106,77 +143,109 @@ def add(proj, kind: str, args: dict) -> Job:
     """入队。**立即返回** —— 调用方（HTTP handler）不该等出图。"""
     if kind not in JOB_KINDS:
         raise ValueError(f"未知作业类型：{kind}（可选 {', '.join(JOB_KINDS)}）")
-    jobs = read_all(proj)
     j = Job(
         id=uuid.uuid4().hex[:12], kind=kind, args=dict(args),
         status=STATUS_PENDING, created_at=time.time(),
         label=JOB_KINDS[kind][0],
     )
-    jobs.append(j)
-    write_all(proj, jobs)
+    with _queue_lock(proj):
+        jobs = read_all(proj)
+        jobs.append(j)
+        write_all(proj, jobs)
     return j
 
 
 def claim_next(proj) -> Job | None:
-    """取下一个待处理作业并标记为 running。**原子性靠重读-改-写**（单进程 drainer，够用）。"""
-    jobs = read_all(proj)
-    for j in jobs:
-        if j.status == STATUS_PENDING:
-            j.status = STATUS_RUNNING
-            j.started_at = time.time()
-            write_all(proj, jobs)
-            return j
+    """
+    取下一个待处理作业并标记为 running。
+
+    「重读-改-写」整个包在锁里才叫原子 —— 原来裸跑时，Web 的 add/cancel 和
+    另一个 drainer 的 claim 会互相覆盖整份文件（B3）。
+    """
+    with _queue_lock(proj):
+        jobs = read_all(proj)
+        for j in jobs:
+            if j.status == STATUS_PENDING:
+                j.status = STATUS_RUNNING
+                j.started_at = time.time()
+                write_all(proj, jobs)
+                return j
     return None
 
 
 def finish(proj, job_id: str, *, ok: bool, note: str = "") -> None:
-    jobs = read_all(proj)
-    for j in jobs:
-        if j.id == job_id:
-            j.status = STATUS_DONE if ok else STATUS_FAILED
-            j.finished_at = time.time()
-            j.note = note[:400]
-            break
-    write_all(proj, jobs)
+    with _queue_lock(proj):
+        jobs = read_all(proj)
+        for j in jobs:
+            if j.id == job_id:
+                j.status = STATUS_DONE if ok else STATUS_FAILED
+                j.finished_at = time.time()
+                j.note = note[:400]
+                break
+        write_all(proj, jobs)
+
+
+def release_to_pending(proj, job_id: str) -> bool:
+    """
+    把 running 的作业**放回 pending**（预算不足暂停时用）。
+
+    为什么单独一个函数而不是复用 cancel：「等批准」不是「失败」——
+    作业没做成就标 failed 会骗人，用户得手动重加。
+    """
+    with _queue_lock(proj):
+        jobs = read_all(proj)
+        hit = False
+        for j in jobs:
+            if j.id == job_id and j.status == STATUS_RUNNING:
+                j.status = STATUS_PENDING
+                j.started_at = 0.0
+                hit = True
+                break
+        if hit:
+            write_all(proj, jobs)
+        return hit
 
 
 def cancel(proj, job_id: str) -> bool:
     """取消一个**还没开始**的作业（正在跑的只能靠「停止」按钮）。"""
-    jobs = read_all(proj)
-    hit = False
-    for j in jobs:
-        if j.id == job_id and j.status == STATUS_PENDING:
-            j.status = STATUS_CANCELED
-            j.finished_at = time.time()
-            hit = True
-            break
-    if hit:
-        write_all(proj, jobs)
-    return hit
+    with _queue_lock(proj):
+        jobs = read_all(proj)
+        hit = False
+        for j in jobs:
+            if j.id == job_id and j.status == STATUS_PENDING:
+                j.status = STATUS_CANCELED
+                j.finished_at = time.time()
+                hit = True
+                break
+        if hit:
+            write_all(proj, jobs)
+        return hit
 
 
 def cancel_pending(proj) -> int:
     """取消全部待处理（已完成/失败的记录保留，便于对账）。"""
-    jobs = read_all(proj)
-    n = 0
-    for j in jobs:
-        if j.status == STATUS_PENDING:
-            j.status = STATUS_CANCELED
-            j.finished_at = time.time()
-            n += 1
-    if n:
-        write_all(proj, jobs)
-    return n
+    with _queue_lock(proj):
+        jobs = read_all(proj)
+        n = 0
+        for j in jobs:
+            if j.status == STATUS_PENDING:
+                j.status = STATUS_CANCELED
+                j.finished_at = time.time()
+                n += 1
+        if n:
+            write_all(proj, jobs)
+        return n
 
 
 def clear_finished(proj) -> int:
     """清掉已完成/失败/取消的记录。"""
-    jobs = read_all(proj)
-    keep = [j for j in jobs if j.status in (STATUS_PENDING, STATUS_RUNNING)]
-    n = len(jobs) - len(keep)
-    if n:
-        write_all(proj, keep)
-    return n
+    with _queue_lock(proj):
+        jobs = read_all(proj)
+        keep = [j for j in jobs if j.status in (STATUS_PENDING, STATUS_RUNNING)]
+        n = len(jobs) - len(keep)
+        if n:
+            write_all(proj, keep)
+        return n
 
 
 def stats(proj) -> dict:
@@ -203,9 +272,17 @@ def drain(proj, log=lambda m: print(m), should_stop=None) -> dict:
 
     单个作业失败**不中断队列** —— 继续跑下一个，失败原因记进 note。
     每处理完一个就写回队列文件，所以 UI 是实时可见的。
+
+    ★ 预算护栏（S4）：**每个作业开跑前**都过一次 budget.check ——
+      入队时没超不代表抽到现在还没超；抽卡队列就是"连点 N 张烧 GPU"的现场，
+      护栏必须罩住这个出口。超了就把作业放回 pending 并停 drainer
+      （「等批准」不是「失败」），用户点「放行」后下次唤醒继续跑。
     """
     from vm import assets as A
+    from vm import budget as B
 
+    # budget 按「项目目录」定位 —— 一律传绝对路径，别让裸名字被解析到默认根去（BUG-2 同类）
+    root = Path(proj.root).resolve()
     done = failed = 0
     while True:
         if should_stop and should_stop():
@@ -215,6 +292,13 @@ def drain(proj, log=lambda m: print(m), should_stop=None) -> dict:
         if j is None:
             break
         label = f"{j.label} {j.args.get('id') or j.args.get('name') or ''}".strip()
+        est = B.job_estimate(j)
+        chk = B.check(root, est)
+        if chk.get("needs_approval") and not B.consume_approval(root):
+            release_to_pending(proj, j.id)
+            log(f"⏸ [{j.id}] {label} 预算不足，已放回队列等批准：" + "；".join(chk.get("reasons") or []))
+            log("  点「放行」（或 python3 -m vm.budget <项目> --approve）后队列会继续")
+            break
         log(f"▶ [{j.id}] {label}")
         try:
             if j.kind == "asset_gen":
@@ -242,10 +326,14 @@ def drain(proj, log=lambda m: print(m), should_stop=None) -> dict:
             else:
                 raise ValueError(f"不支持的作业类型：{j.kind}")
             finish(proj, j.id, ok=True, note=note)
+            # 按**作业实际张数**记账 —— start_async 对 queue 阶段不再预记账，
+            # 避免"启动时把整个队列估进去 + 每个作业再记一笔"的重复计费
+            B.record(root, f"queue:{j.kind}", est, ok=True, note=label)
             done += 1
         except Exception as e:                                  # noqa: BLE001
             msg = f"{type(e).__name__}: {e}"
             log(f"❌ [{j.id}] {label} 失败：{msg}")
             finish(proj, j.id, ok=False, note=msg)
+            B.record(root, f"queue:{j.kind}", est, ok=False, note=f"{label} {msg}")
             failed += 1
     return {"done": done, "failed": failed, "stats": stats(proj)}

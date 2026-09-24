@@ -1,31 +1,275 @@
 /* 视觉取自 printfilm（调研 §11 的原生数值），保留我们的青柠强调色。
-   Element Plus 通过 CSS 变量覆盖，避免逐组件覆写。 */
+   Element Plus 通过 CSS 变量覆盖，避免逐组件覆写。
+
+   T7（2026-09-25）这份文件是**颜色唯一真相**：
+   · 亮色值写在 :root，暗色值只写一遍（--dk-*），两个暗色入口（手动 [data-theme='dark']
+     / 跟随系统 prefers-color-scheme）只做「变量重映射」—— 值不重复，杜绝两套暗色漂移。
+   · 组件里不再出现字面色值：历史硬编码浅色已全部收编成 --surface-2 / --ok-bg 等语义 token。
+   · .dot.tone-* 状态点（原 ShotNav/ShotTable/Filmstrip 三份逐字重复）收编在文末。
+   · 小屏（<1280px）四栏 → 表格主栏 + 左右抽屉（body.ui-drawers-open 开合，由
+     UiToggles.vue 控制）；顶栏窄屏折行/横滚近似（真下拉需要改 TopBar 模板，未做，见交付说明）。 */
 :root {
+  color-scheme: light;
+
+  /* 强调色（青柠）与其上文字 */
   --lime: #b6ff00;
+  --lime-ink: #243300;
+  --lime-deep: #7bb500;
+  --lime-pale: #f2f8e8;
+
+  /* 文字三级 */
   --ink: #111318;
   --muted: #6b7280;
+  --text-2: #4b5563;
+  --text-3: #374151;
+  --text-4: #8b93a1;
+
+  /* 面三级：页面 / 卡片 / 次级面板（表头、格子底）/ 中性填充（占位图、轨道） */
   --bg: #f7f8fa;
   --card: #fff;
+  --surface-2: #fbfbfc;
+  --surface-3: #eef0f3;
   --line: rgba(17, 19, 24, 0.1);
   --hover: #f4fbe0;
-  --ok: #3d6500;
-  --warn: #8a5a12;
-  --bad: #a1261a;
-  --run: #2f6fd0;
+  --hover-border: #c5d4a4;
+
+  /* 状态四色 + 各自的浅底 / 浅边（tag、pill、审批条等全套） */
+  --ok: #3d6500;    --ok-bg: #e9f2d3;   --ok-border: #cfe4a4;
+  --warn: #8a5a12;  --warn-bg: #fdf3e2;  --warn-border: #f0d9ae;
+  --bad: #a1261a;   --bad-bg: #fdeceb;   --bad-border: #eec2bf;
+  --run: #2f6fd0;   --run-bg: #e8f1fd;   --run-border: #bcd6f7;
+
+  /* 中性小件 */
+  --track: #e8eaee;
+  --dot-idle: #c7ccd4;
+  --scroll: #d6dae0;
+  --scroll-hover: #c2c8d0;
+  --badge-veil: rgba(255, 255, 255, 0.92);
+
   --radius: 14px;
   --radius-sm: 10px;
   --shadow: 0 8px 28px rgba(17, 19, 24, 0.06);
   --nav-h: 64px;
 
-  /* Element Plus 主题对齐 */
-  --el-color-primary: #111318;
-  --el-color-success: #3d6500;
-  --el-color-warning: #8a5a12;
-  --el-color-danger: #a1261a;
+  /* Element Plus 主题对齐（全部走上面的 token，暗色自动翻） */
+  --el-color-primary: var(--ink);
+  --el-color-success: var(--ok);
+  --el-color-warning: var(--warn);
+  --el-color-danger: var(--bad);
+  --el-color-info: var(--muted);
   --el-border-radius-base: 8px;
   --el-font-size-base: 13px;
-  --el-text-color-primary: #111318;
-  --el-text-color-regular: #374151;
+  --el-text-color-primary: var(--ink);
+  --el-text-color-regular: var(--text-3);
+}
+
+/* ---------- 暗色配色板（值只写这一遍，两个入口只重映射） ---------- */
+:root {
+  --dk-lime-deep: #9fd300;
+  --dk-lime-pale: #232b12;
+  --dk-ink: #e7e9ee;
+  --dk-muted: #98a1af;
+  --dk-text-2: #b6bdc8;
+  --dk-text-3: #c6ccd5;
+  --dk-text-4: #7d8695;
+  --dk-bg: #121418;
+  --dk-card: #1a1d23;
+  --dk-surface-2: #21252c;
+  --dk-surface-3: #2a2f37;
+  --dk-line: rgba(231, 233, 238, 0.12);
+  --dk-hover: #232d14;
+  --dk-hover-border: #4e6030;
+  --dk-ok: #a3d45c;   --dk-ok-bg: #232e15;  --dk-ok-border: #3d5423;
+  --dk-warn: #d9a24f; --dk-warn-bg: #2e2614; --dk-warn-border: #4d3f1d;
+  --dk-bad: #ef8076;  --dk-bad-bg: #311a18;  --dk-bad-border: #55241f;
+  --dk-run: #79aef2;  --dk-run-bg: #17233a;  --dk-run-border: #273a5c;
+  --dk-track: #262b33;
+  --dk-dot-idle: #3b414a;
+  --dk-scroll: #3b414a;
+  --dk-scroll-hover: #4a515a;
+  --dk-badge-veil: rgba(18, 20, 24, 0.85);
+  --dk-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+}
+
+/* ---------- 暗色入口一：手动切换（UiToggles 写 <html data-theme="dark">） ---------- */
+:root[data-theme='dark'] {
+  color-scheme: dark;
+
+  --lime-deep: var(--dk-lime-deep);
+  --lime-pale: var(--dk-lime-pale);
+  --ink: var(--dk-ink);
+  --muted: var(--dk-muted);
+  --text-2: var(--dk-text-2);
+  --text-3: var(--dk-text-3);
+  --text-4: var(--dk-text-4);
+  --bg: var(--dk-bg);
+  --card: var(--dk-card);
+  --surface-2: var(--dk-surface-2);
+  --surface-3: var(--dk-surface-3);
+  --line: var(--dk-line);
+  --hover: var(--dk-hover);
+  --hover-border: var(--dk-hover-border);
+  --ok: var(--dk-ok);    --ok-bg: var(--dk-ok-bg);    --ok-border: var(--dk-ok-border);
+  --warn: var(--dk-warn); --warn-bg: var(--dk-warn-bg); --warn-border: var(--dk-warn-border);
+  --bad: var(--dk-bad);   --bad-bg: var(--dk-bad-bg);   --bad-border: var(--dk-bad-border);
+  --run: var(--dk-run);   --run-bg: var(--dk-run-bg);   --run-border: var(--dk-run-border);
+  --track: var(--dk-track);
+  --dot-idle: var(--dk-dot-idle);
+  --scroll: var(--dk-scroll);
+  --scroll-hover: var(--dk-scroll-hover);
+  --badge-veil: var(--dk-badge-veil);
+  --shadow: var(--dk-shadow);
+
+  /* Element Plus：主色在暗底上换成青柠（#111318 的按钮在深色里没有对比）。
+     浅底族（-light-3..9）翻成「向卡片色混合」，tag / alert 的底才是暗的。 */
+  --el-color-primary: var(--lime);
+  --el-color-primary-light-3: color-mix(in srgb, var(--lime) 72%, #fff);
+  --el-color-primary-light-5: color-mix(in srgb, var(--lime) 50%, #fff);
+  --el-color-primary-light-7: color-mix(in srgb, var(--lime) 30%, #fff);
+  --el-color-primary-light-8: color-mix(in srgb, var(--lime) 20%, #fff);
+  --el-color-primary-light-9: color-mix(in srgb, var(--lime) 10%, #fff);
+  --el-color-primary-dark-2: color-mix(in srgb, var(--lime) 80%, #000);
+  --el-color-success-light-3: color-mix(in srgb, var(--ok) 80%, var(--card));
+  --el-color-success-light-5: color-mix(in srgb, var(--ok) 55%, var(--card));
+  --el-color-success-light-7: color-mix(in srgb, var(--ok) 32%, var(--card));
+  --el-color-success-light-8: color-mix(in srgb, var(--ok) 22%, var(--card));
+  --el-color-success-light-9: color-mix(in srgb, var(--ok) 12%, var(--card));
+  --el-color-warning-light-3: color-mix(in srgb, var(--warn) 80%, var(--card));
+  --el-color-warning-light-5: color-mix(in srgb, var(--warn) 55%, var(--card));
+  --el-color-warning-light-7: color-mix(in srgb, var(--warn) 32%, var(--card));
+  --el-color-warning-light-8: color-mix(in srgb, var(--warn) 22%, var(--card));
+  --el-color-warning-light-9: color-mix(in srgb, var(--warn) 12%, var(--card));
+  --el-color-danger-light-3: color-mix(in srgb, var(--bad) 80%, var(--card));
+  --el-color-danger-light-5: color-mix(in srgb, var(--bad) 55%, var(--card));
+  --el-color-danger-light-7: color-mix(in srgb, var(--bad) 32%, var(--card));
+  --el-color-danger-light-8: color-mix(in srgb, var(--bad) 22%, var(--card));
+  --el-color-danger-light-9: color-mix(in srgb, var(--bad) 12%, var(--card));
+  --el-color-info-light-8: color-mix(in srgb, var(--muted) 25%, var(--card));
+  --el-color-info-light-9: color-mix(in srgb, var(--muted) 13%, var(--card));
+  --el-bg-color: var(--card);
+  --el-bg-color-overlay: var(--card);
+  --el-fill-color-blank: var(--card);
+  --el-fill-color: var(--surface-3);
+  --el-fill-color-light: var(--surface-2);
+  --el-fill-color-lighter: var(--surface-2);
+  --el-fill-color-extra-light: var(--surface-2);
+  --el-fill-color-dark: var(--surface-3);
+  --el-fill-color-darker: var(--surface-3);
+  --el-border-color: var(--line);
+  --el-border-color-light: var(--line);
+  --el-border-color-lighter: var(--line);
+  --el-border-color-extra-light: var(--line);
+  --el-border-color-dark: var(--line);
+  --el-border-color-darker: var(--line);
+  --el-text-color-secondary: var(--muted);
+  --el-text-color-placeholder: var(--dk-text-4);
+  --el-text-color-disabled: var(--muted);
+  --el-mask-color: color-mix(in srgb, var(--ink) 45%, transparent);
+  --el-box-shadow: var(--shadow);
+  --el-box-shadow-light: var(--shadow);
+  --el-disabled-bg-color: var(--surface-3);
+  --el-disabled-text-color: var(--muted);
+  --el-disabled-border-color: var(--line);
+}
+
+/* 实心 primary 按钮：青柠底必须配深色字（EP 默认配白字，亮绿上读不出来）。
+   success/warning/danger 实心底同理 —— 只有 primary 有实心用法，这里一并兜住。 */
+:root[data-theme='dark'] .el-button--primary,
+:root[data-theme='dark'] .el-button--success,
+:root[data-theme='dark'] .el-button--warning,
+:root[data-theme='dark'] .el-button--danger {
+  --el-button-text-color: var(--lime-ink);
+  --el-button-hover-text-color: var(--lime-ink);
+}
+
+/* ---------- 暗色入口二：跟随系统（UiToggles 未挂载 / 未做选择时的兜底） ----------
+   UiToggles 挂载后会把系统偏好**解析成显式 data-theme** 并实时跟随（matchMedia），
+   这一段只负责 JS 起跑前 / 无 JS 时的底色不闪白。重映射内容与入口一逐行一致。 */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    color-scheme: dark;
+
+    --lime-deep: var(--dk-lime-deep);
+    --lime-pale: var(--dk-lime-pale);
+    --ink: var(--dk-ink);
+    --muted: var(--dk-muted);
+    --text-2: var(--dk-text-2);
+    --text-3: var(--dk-text-3);
+    --text-4: var(--dk-text-4);
+    --bg: var(--dk-bg);
+    --card: var(--dk-card);
+    --surface-2: var(--dk-surface-2);
+    --surface-3: var(--dk-surface-3);
+    --line: var(--dk-line);
+    --hover: var(--dk-hover);
+    --hover-border: var(--dk-hover-border);
+    --ok: var(--dk-ok);    --ok-bg: var(--dk-ok-bg);    --ok-border: var(--dk-ok-border);
+    --warn: var(--dk-warn); --warn-bg: var(--dk-warn-bg); --warn-border: var(--dk-warn-border);
+    --bad: var(--dk-bad);   --bad-bg: var(--dk-bad-bg);   --bad-border: var(--dk-bad-border);
+    --run: var(--dk-run);   --run-bg: var(--dk-run-bg);   --run-border: var(--dk-run-border);
+    --track: var(--dk-track);
+    --dot-idle: var(--dk-dot-idle);
+    --scroll: var(--dk-scroll);
+    --scroll-hover: var(--dk-scroll-hover);
+    --badge-veil: var(--dk-badge-veil);
+    --shadow: var(--dk-shadow);
+
+    --el-color-primary: var(--lime);
+    --el-color-primary-light-3: color-mix(in srgb, var(--lime) 72%, #fff);
+    --el-color-primary-light-5: color-mix(in srgb, var(--lime) 50%, #fff);
+    --el-color-primary-light-7: color-mix(in srgb, var(--lime) 30%, #fff);
+    --el-color-primary-light-8: color-mix(in srgb, var(--lime) 20%, #fff);
+    --el-color-primary-light-9: color-mix(in srgb, var(--lime) 10%, #fff);
+    --el-color-primary-dark-2: color-mix(in srgb, var(--lime) 80%, #000);
+    --el-color-success-light-3: color-mix(in srgb, var(--ok) 80%, var(--card));
+    --el-color-success-light-5: color-mix(in srgb, var(--ok) 55%, var(--card));
+    --el-color-success-light-7: color-mix(in srgb, var(--ok) 32%, var(--card));
+    --el-color-success-light-8: color-mix(in srgb, var(--ok) 22%, var(--card));
+    --el-color-success-light-9: color-mix(in srgb, var(--ok) 12%, var(--card));
+    --el-color-warning-light-3: color-mix(in srgb, var(--warn) 80%, var(--card));
+    --el-color-warning-light-5: color-mix(in srgb, var(--warn) 55%, var(--card));
+    --el-color-warning-light-7: color-mix(in srgb, var(--warn) 32%, var(--card));
+    --el-color-warning-light-8: color-mix(in srgb, var(--warn) 22%, var(--card));
+    --el-color-warning-light-9: color-mix(in srgb, var(--warn) 12%, var(--card));
+    --el-color-danger-light-3: color-mix(in srgb, var(--bad) 80%, var(--card));
+    --el-color-danger-light-5: color-mix(in srgb, var(--bad) 55%, var(--card));
+    --el-color-danger-light-7: color-mix(in srgb, var(--bad) 32%, var(--card));
+    --el-color-danger-light-8: color-mix(in srgb, var(--bad) 22%, var(--card));
+    --el-color-danger-light-9: color-mix(in srgb, var(--bad) 12%, var(--card));
+    --el-color-info-light-8: color-mix(in srgb, var(--muted) 25%, var(--card));
+    --el-color-info-light-9: color-mix(in srgb, var(--muted) 13%, var(--card));
+    --el-bg-color: var(--card);
+    --el-bg-color-overlay: var(--card);
+    --el-fill-color-blank: var(--card);
+    --el-fill-color: var(--surface-3);
+    --el-fill-color-light: var(--surface-2);
+    --el-fill-color-lighter: var(--surface-2);
+    --el-fill-color-extra-light: var(--surface-2);
+    --el-fill-color-dark: var(--surface-3);
+    --el-fill-color-darker: var(--surface-3);
+    --el-border-color: var(--line);
+    --el-border-color-light: var(--line);
+    --el-border-color-lighter: var(--line);
+    --el-border-color-extra-light: var(--line);
+    --el-border-color-dark: var(--line);
+    --el-border-color-darker: var(--line);
+    --el-text-color-secondary: var(--muted);
+    --el-text-color-placeholder: var(--dk-text-4);
+    --el-text-color-disabled: var(--muted);
+    --el-mask-color: color-mix(in srgb, var(--ink) 45%, transparent);
+    --el-box-shadow: var(--shadow);
+    --el-box-shadow-light: var(--shadow);
+    --el-disabled-bg-color: var(--surface-3);
+    --el-disabled-text-color: var(--muted);
+    --el-disabled-border-color: var(--line);
+  }
+  :root:not([data-theme='light']) .el-button--primary,
+  :root:not([data-theme='light']) .el-button--success,
+  :root:not([data-theme='light']) .el-button--warning,
+  :root:not([data-theme='light']) .el-button--danger {
+    --el-button-text-color: var(--lime-ink);
+    --el-button-hover-text-color: var(--lime-ink);
+  }
 }
 
 * { box-sizing: border-box; }
@@ -103,12 +347,12 @@ body {
 }
 .fs-item {
   flex: 0 0 auto; width: 96px; border: 1px solid var(--line); border-radius: 8px;
-  background: #fbfbfc; padding: 3px; cursor: pointer; scroll-snap-align: start;
+  background: var(--surface-2); padding: 3px; cursor: pointer; scroll-snap-align: start;
   transition: border-color .12s ease, box-shadow .12s ease;
 }
-.fs-item:hover { border-color: #c5d4a4; }
+.fs-item:hover { border-color: var(--hover-border); }
 .fs-item.is-active { border-color: var(--lime); box-shadow: 0 0 0 2px color-mix(in srgb, var(--lime) 35%, transparent); }
-.fs-item img, .fs-item .ph { width: 100%; height: 54px; object-fit: cover; border-radius: 5px; display: block; background: #eef0f3; }
+.fs-item img, .fs-item .ph { width: 100%; height: 54px; object-fit: cover; border-radius: 5px; display: block; background: var(--surface-3); }
 .fs-item .ph { display: flex; align-items: center; justify-content: center; font-size: 10.5px; color: var(--muted); }
 .fs-cap { font-size: 10px; color: var(--muted); margin-top: 2px; display: flex; gap: 3px; align-items: center; }
 
@@ -118,13 +362,13 @@ body {
   display: flex; gap: 2px; width: 100%; height: 26px; align-items: stretch;
   background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 2px; overflow: hidden;
 }
-.seg { flex: 0 0 auto; min-width: 3px; border-radius: 4px; background: #6b7280; cursor: pointer; position: relative; transition: filter .15s ease; }
+.seg { flex: 0 0 auto; min-width: 3px; border-radius: 4px; background: var(--muted); cursor: pointer; position: relative; transition: filter .15s ease; }
 .seg:hover { filter: brightness(1.25); }
 .seg.ok { background: var(--ok); }
 .seg.warn { background: var(--warn); }
 .seg.bad { background: var(--bad); }
 .seg.now { outline: 2px solid var(--lime); outline-offset: 1px; }
-.seglegend { display: flex; gap: 12px; align-items: center; margin-top: 6px; }
+.seglegend { display: flex; gap: 12px; align-items: center; margin-top: 6px; flex-wrap: wrap; }
 .seglegend .sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
 .seglegend .sw.ok { background: var(--ok); }
 .seglegend .sw.warn { background: var(--warn); }
@@ -137,9 +381,18 @@ body {
 .tone-run { color: var(--run); }
 .tone-idle { color: var(--muted); }
 
+/* 状态点（U13 去重）：原 ShotNav / ShotTable / Filmstrip 三份逐字重复的 .dot.tone-*，
+   统一收编在这里。语义与 .tone-* 同一套，只是文字色 → 圆点底色。 */
+.dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; background: var(--dot-idle); }
+.dot.tone-ok { background: var(--ok); }
+.dot.tone-warn { background: var(--warn); }
+.dot.tone-bad { background: var(--bad); }
+.dot.tone-run { background: var(--run); }
+.dot.tone-idle { background: var(--dot-idle); }
+
 .shotstatus { display: flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 600; }
 .shotstatus .ck {
-  width: 16px; height: 16px; border-radius: 50%; background: var(--lime); color: #243300;
+  width: 16px; height: 16px; border-radius: 50%; background: var(--lime); color: var(--lime-ink);
   display: inline-flex; align-items: center; justify-content: center; font-size: 11px;
 }
 
@@ -148,20 +401,20 @@ body {
 .shead { display: flex; align-items: center; gap: 7px; font-size: 13px; }
 .shead code { font-size: 10.5px; color: var(--muted); }
 .smeta { margin-top: 3px; }
-.sdesc { margin-top: 6px; font-size: 12px; line-height: 1.55; color: #374151; }
+.sdesc { margin-top: 6px; font-size: 12px; line-height: 1.55; color: var(--text-3); }
 .hintline { margin-top: 6px; font-size: 11px; color: var(--muted); line-height: 1.5; }
 
 /* ---------- 表格 ---------- */
 table.shots { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 12px; }
 table.shots thead th {
-  position: sticky; top: 0; z-index: 2; background: #fbfbfc; text-align: left;
+  position: sticky; top: 0; z-index: 2; background: var(--surface-2); text-align: left;
   font-weight: 600; font-size: 11.5px; color: var(--muted);
   padding: 7px 8px; border-bottom: 1px solid var(--line);
 }
 table.shots tbody td { padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
 table.shots tbody tr:hover { background: var(--hover); }
 table.shots tbody tr.is-active { background: var(--hover); box-shadow: inset 3px 0 0 var(--lime); }
-.thumb { position: relative; width: 100%; aspect-ratio: 16/9; border-radius: 6px; overflow: hidden; background: #eef0f3; }
+.thumb { position: relative; width: 100%; aspect-ratio: 16/9; border-radius: 6px; overflow: hidden; background: var(--surface-3); }
 .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
 /* ① 缩略图格子里直接写字：缺什么就写在画面格，而不是留白 */
 .thumb.empty, .thumb.rendering, .thumb.failed {
@@ -177,8 +430,8 @@ table.shots tbody tr.is-active { background: var(--hover); box-shadow: inset 3px
   background: transparent; padding: 4px 6px; margin: -4px -6px; border-radius: 8px;
   font: inherit; cursor: pointer; color: inherit;
 }
-.cell-edit:hover { border-color: #c5d4a4; background: var(--hover); }
-.cell-edit .line { color: #4b5563; font-size: 12px; line-height: 1.5; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.cell-edit:hover { border-color: var(--hover-border); background: var(--hover); }
+.cell-edit .line { color: var(--text-2); font-size: 12px; line-height: 1.5; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .cell-edit .title { font-size: 12px; line-height: 1.5; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 
 /* ---------- 空态 ---------- */
@@ -188,13 +441,48 @@ table.shots tbody tr.is-active { background: var(--hover); box-shadow: inset 3px
 .skel { display: flex; gap: 6px; padding: 6px 2px; }
 .skel i {
   height: 12px; flex: 1; border-radius: 4px;
-  background: linear-gradient(90deg, #eef0f3 25%, #f7f8fa 50%, #eef0f3 75%);
+  background: linear-gradient(90deg, var(--surface-3) 25%, var(--bg) 50%, var(--surface-3) 75%);
   background-size: 200% 100%; animation: skel 1.2s ease-in-out infinite;
 }
 @keyframes skel { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
 
 /* 横向滚动条细一点，四栏里不抢视线 */
 ::-webkit-scrollbar { width: 9px; height: 9px; }
-::-webkit-scrollbar-thumb { background: #d6dae0; border-radius: 5px; }
-::-webkit-scrollbar-thumb:hover { background: #c2c8d0; }
+::-webkit-scrollbar-thumb { background: var(--scroll); border-radius: 5px; }
+::-webkit-scrollbar-thumb:hover { background: var(--scroll-hover); }
 ::-webkit-scrollbar-track { background: transparent; }
+
+/* ---------- 小屏（<1280px，U11）：四栏 → 表格主栏 + 左右抽屉 ----------
+   开合由 body.ui-drawers-open 控制（UiToggles.vue 的 drawer-toggle / 遮罩 / Esc）。
+   · 左抽屉 = 筛选(168px) + 镜头导航(300px) 并排滑出（合计 ≈ 478px，一屏放得下）
+   · 右抽屉 = 9 tab 栏（420px）
+   · 「导航并入表格首列」：抽屉收起时，表格自带的「场景」首列就是导航入口，
+     不再依赖左侧导航列常驻。
+   · 顶栏阶段区在窄屏**折行/横滚**近似（顶栏模板属 Lead 集成区，真下拉未做 ——
+     交付说明里如实标注）。 */
+@media (max-width: 1279px) {
+  .workbench {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .workbench > .col:nth-child(1),
+  .workbench > .col:nth-child(2),
+  .workbench > .col.col-right {
+    position: fixed;
+    top: calc(var(--nav-h) + 8px);
+    bottom: 8px;
+    z-index: 40;
+    transition: transform .18s ease;
+  }
+  .workbench > .col:nth-child(1) { left: 8px; width: 168px; transform: translateX(calc(-100% - 24px)); }
+  .workbench > .col:nth-child(2) { left: 184px; width: 300px; transform: translateX(calc(-100% - 208px)); }
+  .workbench > .col.col-right {
+    right: 8px;
+    width: min(420px, calc(100vw - 16px));
+    transform: translateX(calc(100% + 24px));
+  }
+  body.ui-drawers-open .workbench > .col:nth-child(1),
+  body.ui-drawers-open .workbench > .col:nth-child(2),
+  body.ui-drawers-open .workbench > .col.col-right {
+    transform: none;
+  }
+}

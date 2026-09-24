@@ -138,7 +138,11 @@
         >{{ d?.locked ? '🔒 已锁定（点击解锁）' : '🔓 未锁定（点击锁定这一版）' }}</el-button>
         <span class="spacer" />
         <el-button :disabled="busy" @click="onSave">保存（只标待重渲）</el-button>
-        <el-button :disabled="busy" @click="onUndo">撤销上一步</el-button>
+        <el-button
+          :disabled="busy || !canUndo"
+          :title="canUndo ? `撤销：${undoLabel}（Ctrl+Z，全局撤销栈）` : '没有可撤销的操作'"
+          @click="onUndo"
+        >↶ 撤销</el-button>
         <el-button :disabled="busy || !d?.clip?.exists" @click="onRerender">重渲</el-button>
         <el-button :disabled="busy" @click="onRewrite">重写提示词（1 次 LLM）</el-button>
         <el-button :disabled="busy" @click="onSplit">拆分</el-button>
@@ -151,12 +155,17 @@
 </template>
 
 <script setup lang="ts">
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, onUnmounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '@/api/client'
 import type { ShotDetail, SectionMap } from '@/api/types'
-import { kindInfo, kindOf as _kindOf, state, storyboardById, type AnyKind } from '@/stores/app'
+import {
+  canUndo, chapterOf, kindInfo, kindOf as _kindOf, pushEdit, refreshAfterEdit,
+  state, storyboardById, submitRerender, undoEdit, undoLabel, type AnyKind,
+} from '@/stores/app'
 import { closeShot, ui } from '@/stores/ui'
+import { confirmAction } from '@/composables/confirmAction'
+import { hotkeySinks } from '@/composables/useHotkeys'
 
 const SIX_CN: Record<string, string> = {
   subject_definitions: '角色定义',
@@ -276,63 +285,187 @@ function patch(): Record<string, unknown> {
   }
 }
 
+/* ---------------- 撤销/重做的快照（U4） ----------------
+ *
+ * 每个 mutation 落地时把自己的**逆操作**交给全局撤销栈（顶栏按钮 / Ctrl+Z 同一条）。
+ * 为什么能做多级撤销：后端 api.undo 只有单步备份（shots/*.json.bak），
+ * 所以字段类编辑一律用「编辑接口互逆」——
+ *   保存/重写：undo = 回写旧值、redo = 回写新值（都是 updateShot）；
+ *   拆/合/插/删：insert 支持**显式 id**，被删/被吞的镜头能原样放回原位，
+ *   于是「删除 = 撤销插回 + 重做再删」也是精确互逆，不靠单步备份。
+ */
+
+/** 把详情还原成「插入」的 item 载荷（含显式 id）。 */
+function itemFromDetail(s: ShotDetail): Record<string, unknown> {
+  const out: Record<string, unknown> = {
+    id: s.id, sec: s.sec, chars: s.chars || [], seed: s.seed,
+    shot_size: s.shot_size || '', camera: s.camera || '',
+    dialogue: s.dialogue || '', narration: s.narration || '',
+    action: s.action || '', prompt: s.prompt || '',
+  }
+  if (Object.keys(s.costume || {}).length) out.costume = s.costume
+  return out
+}
+
+/** 「恢复原值」patch：字段 + **原文 prompt**。
+ *  不用 sections 重拼 —— 原文模式手工改过的段落边界可能拼不回来，直接回写原文最忠实。 */
+function restorePatch(s: ShotDetail): Record<string, unknown> {
+  return {
+    dialogue: s.dialogue, narration: s.narration, shot_size: s.shot_size, camera: s.camera,
+    sec: s.sec, seed: s.seed, chars: s.chars || [], prompt: s.prompt, costume: s.costume || {},
+  }
+}
+
 async function withBusy(fn: () => Promise<void>) {
   busy.value = true
   try { await fn() } catch (e) { ElMessage.error((e as Error).message) } finally { busy.value = false }
 }
 
+/** 保存：写后即刷（U2/B4）—— 以前只 load() 弹层自己，App 空闲不轮询镜头表，
+ *  背后表格长时间显示旧数据，用户以为没生效。现在成功后立即 refreshAfterEdit()。 */
 const onSave = () => withBusy(async () => {
-  const r = await api.updateShot(state.project, d.value!.id, patch())
+  const s = d.value!
+  const before = restorePatch(s)      // 旧值快照（撤销用）
+  const p = patch()                   // 新值（重做用）
+  const r = await api.updateShot(state.project, s.id, p)
+  pushEdit({
+    label: `保存 ${s.id}`,
+    undo: () => api.updateShot(state.project, s.id, before),
+    redo: () => api.updateShot(state.project, s.id, p),
+  })
   ElMessage.success((r.message as string) || '已保存（标为待重渲）')
   await load()
+  await refreshAfterEdit()
 })
+/** 撤销走**全局撤销栈**（顶栏按钮 / Ctrl+Z 同一条账）——
+ *  不再各处直接打后端单步 api.undo（那是"玄学撤销"：只能撤一步、撤的是什么没地方看）。 */
 const onUndo = () => withBusy(async () => {
-  const r = await api.undo(state.project)
-  ElMessage.success((r.message as string) || '已撤销')
+  await undoEdit()
   await load()
 })
 const onRerender = () => withBusy(async () => {
-  await api.rerender(state.project, d.value!.id)
-  ElMessage.success('已提交重渲，看顶部进度')
+  // 渲染提交本地先标「生成中」（submitRerender 内含乐观更新）
+  await submitRerender(d.value!.id)
 })
 const onRewrite = () => withBusy(async () => {
-  await ElMessageBox.confirm(
-    `只重写 ${d.value!.id} 这一镜的六段式提示词？会调用 1 次 DeepSeek，不重跑整章。`,
-    '重写提示词', { type: 'warning' },
-  )
-  const r = await api.rewriteShot(state.project, d.value!.id)
-  ElMessage.success((r.message as string) || '已重写')
+  const s = d.value!
+  const ok = await confirmAction({
+    title: '重写提示词',
+    message: `只重写 ${s.id} 这一镜的六段式提示词？会调用 1 次 DeepSeek，不重跑整章。`,
+    confirmText: '重写',
+  })
+  if (!ok) return
+  const beforePrompt = s.prompt
+  const r = await api.rewriteShot(state.project, s.id)
   await load()
+  const afterPrompt = d.value?.prompt || ''
+  // LLM 结果不可重放 —— redo 记的是**这次**的结果（回写新提示词），不是"再问一次 LLM"
+  pushEdit({
+    label: `重写提示词 ${s.id}`,
+    undo: () => api.updateShot(state.project, s.id, { prompt: beforePrompt }),
+    redo: () => api.updateShot(state.project, s.id, { prompt: afterPrompt }),
+  })
+  ElMessage.success((r.message as string) || '已重写')
+  await refreshAfterEdit()
 })
 const onSplit = () => withBusy(async () => {
+  const s = d.value!
   const v = await ElMessageBox.prompt(
     '拆分点：留空 = 自动按标点找（推荐）；整数 = 台词第 N 个字符处；0~1 小数 = 按比例',
     '拆分镜头', { inputValue: '' },
   ).catch(() => null)
   if (!v) return
-  const s = String(v.value || '').trim()
-  const at = s === '' ? undefined : Number(s)
-  await api.splitShot(state.project, d.value!.id, at)
-  ElMessage.success('已拆分')
+  const t = String(v.value || '').trim()
+  const at = t === '' ? undefined : Number(t)
+  const before = restorePatch(s)
+  const r = await api.splitShot(state.project, s.id, at)
+  const newId = String(r.new_id || '')
+  pushEdit({
+    label: `拆分 ${s.id}`,
+    // 逆操作 = 删掉拆出来的新镜 + 把原镜恢复原值（精确互逆，不靠单步备份）
+    undo: async () => {
+      if (newId) await api.deleteShot(state.project, newId)
+      await api.updateShot(state.project, s.id, before)
+    },
+    redo: () => api.splitShot(state.project, s.id, at),
+  })
+  ElMessage.success((r.message as string) || '已拆分')
   await load()
+  await refreshAfterEdit()
 })
 const onMerge = () => withBusy(async () => {
-  await api.mergeShot(state.project, d.value!.id)
-  ElMessage.success('已与下一镜合并')
+  const s = d.value!
+  if (!s.next_id) return
+  const ok = await confirmAction({
+    title: '合并下一镜',
+    message: `把 ${s.next_id} 合并进 ${s.id}？两镜的台词/旁白/角色/时长会合成一镜，${s.next_id} 这个镜号会被移除（可撤销）。`,
+    list: [s.id, s.next_id],
+    confirmText: '合并',
+    danger: true,
+  })
+  if (!ok) return
+  const before = restorePatch(s)
+  // 撤销要把被吞掉的那一镜**原样**放回来 —— 动手前先存它的完整字段
+  const nextDetail = await api.shot(state.project, s.next_id)
+  const removedId = s.next_id
+  const removedItem = itemFromDetail(nextDetail.shot)
+  const r = await api.mergeShot(state.project, s.id)
+  pushEdit({
+    label: `合并 ${removedId} → ${s.id}`,
+    undo: async () => {
+      await api.insertShot(state.project, s.id, removedItem) // 显式 id，放回原位
+      await api.updateShot(state.project, s.id, before)      // 锚镜恢复原值
+    },
+    redo: () => api.mergeShot(state.project, s.id),
+  })
+  ElMessage.success((r.message as string) || '已与下一镜合并')
   await load()
+  await refreshAfterEdit()
 })
 const onInsert = () => withBusy(async () => {
-  await api.insertShot(state.project, d.value!.id, true)
-  ElMessage.success('已在后面插入新镜')
+  const s = d.value!
+  const r = await api.insertShot(state.project, s.id)
+  const newId = String(r.new_id || '')
+  // redo 要能原样重放 —— 存下新镜的完整字段（插入默认继承锚镜、时长压到下限）
+  const det = newId ? await api.shot(state.project, newId).catch(() => null) : null
+  const item = det ? itemFromDetail(det.shot) : null
+  if (newId) {
+    pushEdit({
+      label: `插入 ${newId}`,
+      undo: () => api.deleteShot(state.project, newId),
+      redo: () => api.insertShot(state.project, s.id, item || undefined),
+    })
+  }
+  ElMessage.success((r.message as string) || '已在后面插入新镜')
   await load()
+  await refreshAfterEdit()
 })
 const onDelete = () => withBusy(async () => {
-  await ElMessageBox.confirm(`删除 ${d.value!.id}？可点顶部「撤销上一步」恢复。`, '删除镜头', { type: 'warning' })
-  await api.deleteShot(state.project, d.value!.id)
+  const s = d.value!
+  const ok = await confirmAction({
+    title: '删除镜头',
+    message: `删除 ${s.id}？成片按镜头表组装，删除后不再包含它；产物文件不删。可用顶栏「撤销」（Ctrl+Z）找回。`,
+    list: [`${s.id}　${(s.dialogue || s.narration || '（无台词）').slice(0, 30)}`],
+    confirmText: '删除',
+    danger: true,
+  })
+  if (!ok) return
+  const item = itemFromDetail(s)
+  // 撤销 = 把它插回原位。insert 是「在锚点之后」，锚点取**同章**的前一镜；
+  // 删的是本章第一镜时没有同章锚点（insert 插不进文件头），退回后端单步备份恢复。
+  const prev = s.prev_id && chapterOf(s.prev_id) === chapterOf(s.id) ? s.prev_id : ''
+  await api.deleteShot(state.project, s.id)
+  pushEdit({
+    label: `删除 ${s.id}`,
+    undo: prev ? () => api.insertShot(state.project, prev, item) : () => api.undo(state.project),
+    redo: () => api.deleteShot(state.project, s.id),
+  })
   ElMessage.success('已删除')
   closeShot()
+  await refreshAfterEdit()
 })
-/** E1：锁定 / 解锁。锁定后渲染层会跳过它（只有显式强制重跑才能改）。 */
+/** E1：锁定 / 解锁。锁定后渲染层会跳过它（只有显式强制重跑才能改）。
+ *  setFlag 自己入撤销栈（锁定是可回滚的资产操作）。 */
 const onLock = () => withBusy(async () => {
   const cur = !!d.value!.locked
   const r = await api.lockShot(state.project, d.value!.id, 'locked', !cur)
@@ -357,6 +490,18 @@ function toggleRaw() {
   }
   raw.value = !raw.value
 }
+
+/* ---------------- 与全局的两根线 ---------------- */
+// ① 撤销/重做后弹层内容要跟着变 —— 按 Ctrl+Z 时用户多半正看着这一镜
+watch(() => state.historyRev, () => { if (ui.modalOpen) void load() })
+// ② Ctrl+S = 保存：弹层打开时把自己的保存函数登记给快捷键层。
+//    登记表（hotkeySinks）让 composables 不必反向 import 组件。
+watch(
+  () => ui.modalOpen,
+  (open) => { hotkeySinks.save = open ? () => onSave() : null },
+  { immediate: true },
+)
+onUnmounted(() => { hotkeySinks.save = null })
 </script>
 
 <style scoped>
@@ -368,14 +513,14 @@ function toggleRaw() {
 .sblabel { margin-top: 3px; }
 .novideo {
   aspect-ratio: 16/9; display: flex; align-items: center; justify-content: center;
-  background: #eef0f3; border-radius: 10px; color: var(--muted); font-size: 12.5px;
+  background: var(--surface-3); border-radius: 10px; color: var(--muted); font-size: 12.5px;
 }
 .meta2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 3px 12px; font-size: 11.5px; }
 .meta2 code { font-size: 11px; }
 .lockrow { margin-top: 7px; font-size: 11.5px; color: var(--warn); font-weight: 600; }
-.issues { margin-top: 8px; font-size: 11.5px; line-height: 1.6; border-radius: 8px; padding: 6px 8px; background: #f4f7ea; }
-.issues.warn { background: #fdf6e3; }
-.issues.bad { background: #fdeceb; }
+.issues { margin-top: 8px; font-size: 11.5px; line-height: 1.6; border-radius: 8px; padding: 6px 8px; background: var(--ok-bg); }
+.issues.warn { background: var(--warn-bg); }
+.issues.bad { background: var(--bad-bg); }
 .issues ul { margin: 3px 0 0; padding-left: 16px; }
 .frow2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; margin-top: 10px; }
 .frow3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin-top: 8px; }

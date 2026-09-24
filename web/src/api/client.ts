@@ -123,8 +123,13 @@ export const api = {
   mergeShot: (project: string, id: string) =>
     post<SimpleResult>('/api/shot/merge', { project, id }),
 
-  insertShot: (project: string, id: string, after = true) =>
-    post<SimpleResult>('/api/shot/insert', { project, id, after }),
+  /** 在 `afterId` 之后插入一镜。
+   *  ★ 契约修正（T5）：后端 `/api/shot/insert` 的 `after` 是**锚点镜头号**（在哪一镜之后插），
+   *  不是"插前/插后"的布尔 —— 旧签名 `after = true` 会把布尔值当镜头号发出去
+   *  （后端 `str(True)` → 找不到镜「True」），「插入新镜」实际是坏的。
+   *  `shot` 可带完整字段（支持**显式 id**）—— 删除/合并的撤销就靠它把镜头原样放回原位。 */
+  insertShot: (project: string, afterId: string, shot?: Record<string, unknown>) =>
+    post<SimpleResult>('/api/shot/insert', { project, after: afterId, ...(shot ? { shot } : {}) }),
 
   deleteShot: (project: string, id: string) =>
     post<SimpleResult>('/api/shot/delete', { project, id }),

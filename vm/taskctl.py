@@ -30,10 +30,12 @@ CLI 只负责「前台等待 + 转发信号」，不自己执行阶段代码；�
 
 from __future__ import annotations
 
+import copy
 import fcntl
 import hashlib
 import importlib
 import json
+import math
 import os
 import shutil
 import re
@@ -272,6 +274,14 @@ def import_module(name: str):
     return mod
 
 
+# ── stage_readiness 缓存（S8：readiness 按需）───────────────────────────────
+# /api/status 每 2s 把 8 个阶段的 readiness 全问一遍，每次都读 vm/*.py 全文做
+# 正则扫描（_module_missing_api）+ 逐模块 stat —— 而结果只在**队友改代码**时才变。
+# 按所涉模块文件的 mtime+size 做键：文件没动就复用，动了立刻重算；TTL 兜底。
+_READY_TTL = 30.0
+_READY_CACHE: dict[tuple, tuple[float, dict]] = {}
+
+
 def stage_readiness(stage: str) -> dict:
     """阶段是否可跑 + 缺了什么。UI 用它把按钮标灰并给出原因。"""
     if stage not in STAGE_MODULES:
@@ -287,6 +297,21 @@ def stage_readiness(stage: str) -> dict:
         need = list(STAGE_MODULES[stage])
         api = STAGE_API.get(stage, {})
 
+    # 缓存键 = (阶段, 所涉模块文件的 mtime/size) —— 只 stat 不读文件
+    sig_list: list[tuple] = []
+    for m in sorted(set(need) | set(api)):
+        try:
+            s = _module_file(m).stat()
+            sig_list.append((m, int(s.st_mtime_ns), s.st_size))
+        except OSError:
+            sig_list.append((m, 0, 0))
+    key = (stage, tuple(sig_list))
+    hit = _READY_CACHE.get(key)
+    if hit is not None and time.time() - hit[0] < _READY_TTL:
+        return copy.deepcopy(hit[1])
+    if len(_READY_CACHE) > 64:   # 每次改代码换一个键，别让缓存无限长
+        _READY_CACHE.clear()
+
     missing = [m for m in need if not module_ready(m)]
     halffinished: list[str] = []
     for mod, attrs in api.items():
@@ -300,13 +325,15 @@ def stage_readiness(stage: str) -> dict:
         why.append("缺文件：" + "、".join(f"vm/{m}.py" for m in missing))
     if halffinished:
         why.append("未写完：" + "、".join(halffinished))
-    return {
+    out = {
         "stage": stage,
         "ready": not missing and not halffinished,
         "missing": missing,
         "halffinished": halffinished,
         "message": "" if not (missing or halffinished) else "；".join(why) + "，该阶段暂不可运行",
     }
+    _READY_CACHE[key] = (time.time(), copy.deepcopy(out))
+    return out
 
 
 def _module_missing_api(mod: str, attrs: tuple[str, ...]) -> list[str]:
@@ -324,13 +351,40 @@ def _module_missing_api(mod: str, attrs: tuple[str, ...]) -> list[str]:
 
 
 def frames_for_seconds(sec: Any, fps: int = 24) -> int:
-    """17n+5 网格兜底实现（权威在 vm/shots.seconds_to_frames）。"""
+    """
+    秒 → 17n+5 网格帧数。**直接代理 vm/shots.seconds_to_frames**（契约明文：权威在 shots.py）。
+
+    为什么必须代理而不是各写各的（BUG-3 实锤）：两套换算一个用 round-half-even、
+    一个用 half-up，`sec*fps` 落在半帧值时**差一格网格**（复现：
+    frames_for_seconds(2.6875) 曾得 56、seconds_to_frames(2.6875) 得 73 帧）——
+    同一个镜头在指纹/进度和渲染提交里帧数不一致，表看着好好的、渲出来对不上。
+
+    兜底分支只在 vm/shots.py 缺失/正被写入时生效（服务永远起得来），
+    数学与权威**逐行同语义**（half-up + [56,362] clamp），不许再出现第二套口径。
+    """
     try:
-        target = int(round(float(sec) * int(fps)))
-    except (TypeError, ValueError):
-        target = 0
-    n = max(0, int(round((target - 5) / _FRAME_STEP)))
-    return max(_FRAME_MIN, min(_FRAME_MAX, n * _FRAME_STEP + 5))
+        from vm.shots import seconds_to_frames
+        return int(seconds_to_frames(sec, int(fps)))
+    except Exception:  # noqa: BLE001 —— shots 未就绪时降级，不允许把服务拖挂
+        # clamp 上下限与 vm/shots 同步读 VM_FRAME_MIN / VM_FRAME_MAX
+        # （config-center 的帧网格配置经环境变量注入；缺省 56/362 —— 兜底口径
+        #  必须和权威一致，包括配置覆盖之后）
+        try:
+            fmin = int(os.environ.get("VM_FRAME_MIN") or _FRAME_MIN)
+            fmax = int(os.environ.get("VM_FRAME_MAX") or _FRAME_MAX)
+        except ValueError:
+            fmin, fmax = _FRAME_MIN, _FRAME_MAX
+        try:
+            s = float(sec)
+        except (TypeError, ValueError):
+            s = 0.0
+        if s <= 0:
+            return fmin
+        n_min = (fmin - 5) // _FRAME_STEP
+        n_max = (fmax - 5) // _FRAME_STEP
+        n = int(math.floor((s * int(fps) - 5) / _FRAME_STEP + 0.5))
+        n = max(n_min, min(n_max, n))
+        return n * _FRAME_STEP + 5
 
 
 # ---------------------------------------------------------------- pid 安全
@@ -866,6 +920,45 @@ def _shot_order(sid: str) -> tuple:
     return tuple(nums) + (0,) * (3 - len(nums))
 
 
+# ── shot_table 缓存（S8：/api/status 减负）──────────────────────────────────
+# 为什么：前端 2s 轮询一次 /api/status，每次全量重算指纹表（读全部 shots/*.json +
+# 逐镜 md5 指纹 + validate + stat 全部产物）—— 空闲时输入根本没变，纯浪费。
+# 策略 = **mtime 签名 + 短 TTL 双条件**：
+#   · 签名（只 stat 不读文件）没变 → 复用缓存；任何输入一变（编辑/渲出一镜/换参考图）
+#     立刻重算，写后即刷不受影响；
+#   · TTL 是兜底上限：签名万一看漏了什么（例如 vm/shots.py 自身行为变化），
+#     最坏陈旧 _SHOT_TABLE_TTL 秒后也强制重算。
+# 返回一律 deepcopy —— 调用方会往结果里塞 ok/url 字段（web 层），不能污染缓存。
+_SHOT_TABLE_TTL = 10.0
+_SHOT_TABLE_CACHE: dict[str, tuple[float, tuple, dict]] = {}
+
+
+def _shot_table_signature(pdir: Path) -> tuple:
+    """输入签名：镜头表/参考图/产物/manifest/qc/params 的 (路径, mtime_ns, size)。"""
+    proj = Project(pdir)
+    items: list[Any] = []
+
+    def _stamp(f: Path) -> None:
+        try:
+            s = f.stat()
+            items.append((str(f), int(s.st_mtime_ns), s.st_size))
+        except OSError:
+            items.append((str(f), 0, 0))
+
+    _stamp(pdir / "project.json")
+    for d, pat in ((proj.shots_dir, "*.json"), (proj.refs_dir, "char_*.png"), (proj.clips_dir, "*.mp4")):
+        try:
+            names = sorted(x.name for x in d.glob(pat))
+        except OSError:
+            names = []
+        items.append((str(d), tuple(names)))
+        for n in names:
+            _stamp(d / n)
+    _stamp(proj.state_dir / "manifest.json")
+    _stamp(proj.state_dir / "qc.json")
+    return tuple(items)
+
+
 def shot_table(project: str | os.PathLike[str], root: Path | None = None) -> dict:
     """
     镜头表 + 每镜三态 + 质检结果。Web 的 /api/shots 直接吐这个结构。
@@ -874,6 +967,13 @@ def shot_table(project: str | os.PathLike[str], root: Path | None = None) -> dic
     并在返回里标 source=fallback（诚实标注，不假装精确）。
     """
     pdir = resolve_project(project, root)
+    # ── 缓存命中：输入没动过 + 没超 TTL，直接复用（见 _SHOT_TABLE_CACHE 注释）──
+    _sig = _shot_table_signature(pdir)
+    _hit = _SHOT_TABLE_CACHE.get(str(pdir))
+    if _hit is not None:
+        _at, _hit_sig, _data = _hit
+        if _hit_sig == _sig and time.time() - _at < _SHOT_TABLE_TTL:
+            return copy.deepcopy(_data)
     proj = Project(pdir)
     params = load_params(pdir)
     issues: list[str] = []
@@ -1003,7 +1103,7 @@ def shot_table(project: str | os.PathLike[str], root: Path | None = None) -> dic
     #   状态标签在 UI 上已经单独显示了，顺序应该还原成剧本顺序，
     #   否则镜头表根本没法当分镜稿读（1-10-01 排在 1-1-01 前面也是同一类错误）。
     rows.sort(key=lambda r: _shot_order(r["id"]))
-    return {
+    _out = {
         "project": str(pdir.name),
         "source": source,
         "shots": rows,
@@ -1011,6 +1111,10 @@ def shot_table(project: str | os.PathLike[str], root: Path | None = None) -> dic
         "counts": counts,
         "shots_dir": str(proj.shots_dir),
     }
+    # 存副本、返回原件：调用方会往结果里塞 ok / url 字段，不能污染缓存。
+    # dict 赋值是原子的，Web 多线程并发时最坏只是各算各的，不会写坏。
+    _SHOT_TABLE_CACHE[str(pdir)] = (time.time(), _sig, copy.deepcopy(_out))
+    return _out
 
 
 # ---------------------------------------------------------------- 镜头详情与编辑（P1）
@@ -1836,6 +1940,11 @@ def set_shot_flag(
     只有显式 force 才能动它。
 
     **锁定同时记录时间与操作者**：那是排查"为什么这个镜头改不动"的唯一线索。
+
+    ★ 无产物镜头 = **优雅跳过**，不是 400（lead 裁决，2026-09-25）：
+    单镜锁定 UI 本来就禁用没渲的镜头，真正踩到这坑的是**批量**（勾选里混着没渲的）——
+    抛错会把整批炸掉。现在单镜返回 200 + locked:false + 人话 note，
+    批量调用方按响应里的 `skipped` 列表汇总，个别项永远不拖垮整批。
     """
     if flag not in ("locked", "selected", "favorite"):
         raise TaskError(f"未知标记：{flag}（只支持 locked / selected / favorite）")
@@ -1845,10 +1954,14 @@ def set_shot_flag(
     proj = Project(pdir)
     manifest = proj.manifest
     if str(shot_id) not in manifest.shots:
-        raise TaskError(
-            f"镜头 {shot_id} 还没有产物记录，无法锁定（先渲染一次；"
-            f"锁定的是「已产出的这一版」，没有产物就没有可锁的东西）"
-        )
+        return {
+            "shot": str(shot_id),
+            "locked": False, "locked_at": 0, "locked_by": "",
+            "selected": False, "favorite": False,
+            "skipped": [str(shot_id)],
+            "note": "无产物记录，已跳过",
+            "message": f"{shot_id} 无产物记录，已跳过（先渲染一次才有可锁的版本）",
+        }
     manifest.set_flag(str(shot_id), flag, bool(value), by=by)
     e = manifest.shots[str(shot_id)]
     return {
@@ -1858,6 +1971,7 @@ def set_shot_flag(
         "locked_by": e.locked_by,
         "selected": e.selected,
         "favorite": e.favorite,
+        "skipped": [],
         "message": (
             f"已{'锁定' if e.locked else '解锁'} {shot_id}"
             + (f"（{e.locked_by}）" if e.locked else "")
@@ -4001,8 +4115,12 @@ def start_async(
             ap_ = _budget.consume_approval(pdir)   # 一次性放行
             if not ap_:
                 raise NeedsApproval({**chk, "stage": stage, "project": pdir.name})
-        # 记一笔"已放行并开始"（成本台账，按日轮转）
-        _budget.record(pdir, stage, est, ok=True, note="started")
+        # 记一笔"已放行并开始"（成本台账，按日轮转）。
+        # queue 阶段**不在这儿记**：它的 est 是整个队列的预估，真正跑多少取决于
+        # 之后逐个消费的作业 —— queue.drain 会按作业实际张数逐笔记账，
+        # 这里再记一笔整队列预估就是重复计费（今日已用会翻倍）。
+        if stage != "queue":
+            _budget.record(pdir, stage, est, ok=True, note="started")
 
     with _project_lock(pdir):
         cur = read_task(pdir)

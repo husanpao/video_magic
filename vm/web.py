@@ -21,12 +21,17 @@ import json
 import os
 import re
 import subprocess
+import sys
+import threading
 import time
+import traceback
 import urllib.parse
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutTimeout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from vm import taskctl
+from vm import config as vm_config  # T3 配置中心：/api/config 委托给它，本层只做参数校验+错误映射
 from vm.state import Project
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -70,8 +75,43 @@ class _Abort(Exception):
         self.extra = dict(extra or {})
 
 
+def _log_exc(where: str) -> None:
+    """
+    服务端异常必须留栈到 stderr —— 不留栈就没法排障。
+
+    为什么不走 logging：本文件其余输出（log_message 等）都是 print 直写，
+    保持同一出口（stderr）保证「制造服务端异常 → 500 且日志有栈」可以被验证。
+    """
+    print(f"[web] 服务端异常 @ {where}", file=sys.stderr, flush=True)
+    traceback.print_exc(file=sys.stderr)
+
+
+# 任务层抛出的「已知输入错误」：请求本身有问题，映射成 4xx + 人话。
+# 为什么单列一份：以前 upload/adopt 把**一切**异常折叠成 400，服务端 bug
+# （磁盘满、代码缺陷）伪装成「请求错误」，排障失真。现在的纪律是：
+#   已知输入错误（TaskError / ValueError / FileNotFoundError）→ 4xx；
+#   其余异常 → 不在 handler 里折叠，冒到 _dispatch 兜底 → 500 server_error + 留栈。
+_CLIENT_ERRORS = (taskctl.TaskError, ValueError, FileNotFoundError)
+
+
 def _thumb_path(proj: Project, key: str) -> Path:
     return proj.state_dir / "thumbs" / f"{key}.jpg"
+
+
+def _thumb_safe_key(key: str) -> str:
+    # key 里可能带 `/`（例如 gacha/孙悟空/seed2741），换成 `__` 保证是单个文件名
+    return re.sub(r"[^A-Za-z0-9_.\-]", "_", key.replace("/", "__"))
+
+
+def _thumb_cached(proj: Project, key: str, src: Path) -> Path | None:
+    """缓存命中（存在 + 不比源文件旧 + 非空）就返回缩略图路径，否则 None。"""
+    dst = _thumb_path(proj, _thumb_safe_key(key))
+    try:
+        if dst.exists() and dst.stat().st_mtime >= src.stat().st_mtime and dst.stat().st_size > 0:
+            return dst
+    except OSError:
+        pass
+    return None
 
 
 def _make_thumb(proj: Project, key: str, src: Path) -> Path | None:
@@ -80,17 +120,15 @@ def _make_thumb(proj: Project, key: str, src: Path) -> Path | None:
 
     既能处理片段（clips/*.mp4）也能处理静图（定妆照/抽卡候选），
     因为 ffmpeg 对单张 PNG 也会输出一帧。
-    key 里可能带 `/`（例如 gacha/孙悟空/seed2741），这里换成 `__` 保证是单个文件名。
 
     注意：只读项目产物，只往本项目 state/ 写 —— 绝不碰 ComfyUI 的 output/。
+    ⚠️ 里面有 ffmpeg（最坏 25s 超时）——**不要在请求线程直接调**，
+    走 `_thumb_request()` 的后台线程池（S9：缩略图异步化）。
     """
-    safe_key = re.sub(r"[^A-Za-z0-9_.\-]", "_", key.replace("/", "__"))
-    dst = _thumb_path(proj, safe_key)
-    try:
-        if dst.exists() and dst.stat().st_mtime >= src.stat().st_mtime and dst.stat().st_size > 0:
-            return dst
-    except OSError:
-        pass
+    hit = _thumb_cached(proj, key, src)
+    if hit is not None:
+        return hit
+    dst = _thumb_path(proj, _thumb_safe_key(key))
     dst.parent.mkdir(parents=True, exist_ok=True)
     tmp = dst.with_name(dst.stem + ".tmp.jpg")
     # 只有视频才需要 -ss 跳开头：对单张静图 seek 0.5s 会"跳过唯一一帧"，
@@ -114,6 +152,68 @@ def _make_thumb(proj: Project, key: str, src: Path) -> Path | None:
     return dst
 
 
+# ── 缩略图异步化（S9）────────────────────────────────────────────────────────
+# 为什么：_make_thumb 里的 ffmpeg 最坏 25s —— 同步跑在请求线程上时，首屏 52 张
+# 缩略图能把整个 Web 拖死（诊断 2.7）。现在的策略：
+#   · 缓存命中 → 直接给（绝大多数二次加载）；
+#   · 未命中 → 丢给小线程池后台生成（single-flight 去重，同 key 不重复跑 ffmpeg；
+#     2 并发上限，52 张也不会把机器轰爆），请求**最多等 _THUMB_WAIT 秒**；
+#   · 等到了 → 给真图（静图普遍 <1s，正常体验不变）；
+#   · 等不到 → 给占位图 + `X-Thumb-Pending: 1` + no-store（前端可延迟换 URL 重试），
+#     绝不再让请求线程扛满 25s。
+_THUMB_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="vm-thumb")
+_THUMB_FUTURES: dict[str, Future] = {}
+_THUMB_FUTURES_LOCK = threading.Lock()
+_THUMB_WAIT = 2.5
+
+# 占位图：360×240 深灰 JPEG（740 字节，ffmpeg color 源生成后内嵌 —— 纯标准库
+# 没有编码器可用，内嵌字节是唯一不引入依赖的做法）
+_PLACEHOLDER_JPEG = base64.b64decode(
+    "/9j/4AAQSkZJRgABAgAAAQABAAD//gARTGF2YzU4LjEzNC4xMDAA/9sAQwAIDAwODA4QEBAQEBAT"
+    "EhMUFBQTExMTFBQUFRUVGRkZFRUVFBQVFRgYGRkbHBsaGhkaHBweHh4kJCIiKiorMzM+/8QATAAB"
+    "AQAAAAAAAAAAAAAAAAAAAAcBAQEAAAAAAAAAAAAAAAAAAAACEAEAAAAAAAAAAAAAAAAAAAAAEQEA"
+    "AAAAAAAAAAAAAAAAAAAA/8AAEQgA8AFoAwEiAAIRAAMRAP/aAAwDAQACEQMRAD8AnICwAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB/9k="
+)
+
+
+def _thumb_request(proj: Project, key: str, src: Path) -> tuple[Path | None, bool]:
+    """
+    拿缩略图（异步化入口）。返回 (文件, pending)：
+      (Path, False)  → 真图就绪，直接发；
+      (None, True)   → 后台还在生成，调用方发占位图 + X-Thumb-Pending: 1；
+      (None, False)  → 生成失败（ffmpeg 不可用/文件损坏），调用方报 thumb_failed。
+    """
+    hit = _thumb_cached(proj, key, src)
+    if hit is not None:
+        return hit, False
+    fkey = f"{proj.root}|{key}|{src}"
+    with _THUMB_FUTURES_LOCK:
+        fut = _THUMB_FUTURES.get(fkey)
+        if fut is None or fut.done():
+            # single-flight：同一个 key 只跑一个 ffmpeg；做完了下次要图再重试失败
+            fut = _THUMB_POOL.submit(_make_thumb, proj, key, src)
+            _THUMB_FUTURES[fkey] = fut
+            if len(_THUMB_FUTURES) > 256:   # 顺手清掉已完成的，别让表无限长
+                for k in [k for k, v in _THUMB_FUTURES.items() if v.done() and k != fkey]:
+                    _THUMB_FUTURES.pop(k, None)
+    try:
+        return fut.result(timeout=_THUMB_WAIT), False
+    except FutTimeout:
+        return None, True
+    except Exception:  # noqa: BLE001 —— 后台炸了不许把请求线程带走
+        _log_exc(f"thumb {key}")
+        return None, False
+
+
 def _resolve_shot_clip(proj: Project, shot: str) -> Path:
     if not SHOT_RE.match(shot or ""):
         raise _Abort(400, "bad_shot", f"非法镜头号：{shot!r}")
@@ -135,7 +235,7 @@ _IMAGE_MAGIC = (
 )
 
 
-def _decode_image_b64(b64: Any) -> bytes:
+def _decode_image_b64(b64: object) -> bytes:
     """
     解 base64（容忍 data:image/png;base64, 前缀），并做魔数校验。
 
@@ -219,6 +319,105 @@ def _resolve_view_target(proj: Project, kind: str, name: str, file: str) -> tupl
         ctype = "video/mp4" if p.suffix.lower() == ".mp4" else "image/" + p.suffix.lstrip(".").lower()
         return p, ctype, f"charraw__{p.stem}"
     raise _Abort(400, "bad_kind", f"未知 kind：{kind!r}（应为 ref/gacha/sheet/char_raw/storyboard）")
+
+
+# ---------------------------------------------------------------- 路由表
+#
+# 为什么表化：原来 do_GET/do_POST 是 48 个 if 手工配对 —— `/api/budget` 写好了
+# handler 却忘了接线，前端调用恒 404（B1 死路由）。现在「路径 → handler 方法名」
+# 一张表、分发只有一处；再配 `_verify_routes` 启动自检（每个 api_* 必须已注册、
+# 每个表项必须真有方法），"写 handler 忘接线"在**启动时**就报错，不用等用户点到。
+#
+# 值用「方法名字符串」而不是函数对象：handler 类在 make_handler() 里才成形
+# （闭包绑 projects_root），模块加载时拿不到函数对象；字符串查表照样能自检。
+
+ROUTES_GET = {
+    "/": "page_index",
+    "/index.html": "page_index",
+    "/favicon.ico": "page_favicon",
+    "/api/projects": "api_projects",
+    "/api/status": "api_status",
+    "/api/completeness": "api_completeness",
+    "/api/script": "api_script",
+    "/api/chapters": "api_chapters",
+    "/api/storyboard": "api_storyboard",
+    "/api/scenes": "api_scenes",
+    "/api/reset/preview": "api_reset_preview",
+    "/api/queue": "api_queue",
+    "/api/assets": "api_assets",
+    "/api/props": "api_props",
+    "/api/budget": "api_budget",
+    "/api/config": "api_config",
+    "/api/shots": "api_shots",
+    "/api/log": "api_log",
+    "/api/chars": "api_chars",
+    "/api/shot": "api_shot",
+    "/api/qc": "api_qc",
+    "/api/audit": "api_audit",
+    "/view": "view",
+}
+
+ROUTES_POST = {
+    "/api/reset": "api_reset",
+    "/api/scene/update": "api_scene_update",
+    "/api/prop/update": "api_prop_update",
+    "/api/queue/add": "api_queue_add",
+    "/api/queue/cancel": "api_queue_cancel",
+    "/api/queue/clear": "api_queue_clear",
+    "/api/asset/gen": "api_asset_gen",
+    "/api/asset/upload": "api_asset_upload",
+    "/api/asset/adopt": "api_asset_adopt",
+    "/api/approve": "api_approve",
+    "/api/config": "api_config_save",
+    "/api/config/validate": "api_config_validate",
+    "/api/run": "api_run",
+    "/api/stop": "api_stop",
+    "/api/rerender": "api_rerender",
+    "/api/chars/gacha": "api_chars_gacha",
+    "/api/chars/adopt": "api_chars_adopt",
+    "/api/chars/upload": "api_chars_upload",
+    "/api/chars/prompt": "api_chars_prompt",
+    # P1：镜头编辑（全部走 taskctl，Web 自己不做业务逻辑）
+    "/api/shot/lock": "api_shot_lock",
+    "/api/shot/update": "api_shot_update",
+    "/api/shot/rewrite": "api_shot_rewrite",
+    "/api/shot/split": "api_shot_split",
+    "/api/shot/merge": "api_shot_merge",
+    "/api/shot/insert": "api_shot_insert",
+    "/api/shot/delete": "api_shot_delete",
+    "/api/shot/undo": "api_shot_undo",
+    "/api/shots/bulk": "api_shots_bulk",
+    "/api/shots/renumber": "api_shots_renumber",
+}
+
+# 唯一的「前缀路由」：Vite 产物 /assets/<file>（文件名带 hash，无法逐个精确登记）。
+# 除此之外一律精确匹配 —— 前缀路由是目录穿越的高发区，只留这一个口子。
+PREFIX_ROUTES_GET = {"/assets/": "page_asset"}
+
+# 需要放宽请求体上限的路由（上传走 base64，会膨胀 4/3）
+BODY_LIMITS = {"/api/chars/upload": MAX_UPLOAD_BODY}
+
+
+def _verify_routes(cls) -> None:
+    """
+    启动自检：路由表 ↔ handler 方法必须一一对应，漏一个都当场报错。
+
+    两个方向都查（B1 的根因是"只查了一个方向"甚至没查）：
+      · 表项指向不存在的方法 —— 改名/删方法忘更新表；
+      · api_* 方法没进任何表 —— 新写 handler 忘接线。
+    """
+    problems: list[str] = []
+    registered: set[str] = set()
+    for table in (ROUTES_GET, ROUTES_POST, PREFIX_ROUTES_GET):
+        for path, name in table.items():
+            registered.add(name)
+            if not callable(getattr(cls, name, None)):
+                problems.append(f"路由 {path} → {name}：Handler 上没有这个方法")
+    for name in sorted(dir(cls)):
+        if name.startswith("api_") and name not in registered:
+            problems.append(f"handler {name} 没有注册进路由表（写 handler 忘接线？）")
+    if problems:
+        raise RuntimeError("路由自检失败：\n  " + "\n  ".join(problems))
 
 
 # ---------------------------------------------------------------- Handler
@@ -380,133 +579,64 @@ def make_handler(projects_root: Path, default_project: str | None = None):
                 raise _Abort(400, "bad_json", "请求体必须是 JSON 对象")
             return d
 
-        # -- 路由
+        # -- 路由（查表分发，见文件头 ROUTES_*）
 
         def do_GET(self):  # noqa: N802
-            try:
-                path = urllib.parse.urlparse(self.path).path
-                if path in ("/", "/index.html"):
-                    # Vue 产物优先；没有就回退旧单文件
-                    page = DIST_INDEX if DIST_INDEX.is_file() else INDEX_HTML
-                    text = page.read_text(encoding="utf-8") if page.is_file() else _FALLBACK_HTML
-                    return self._html(text)
-                if path.startswith("/assets/"):
-                    return self._static_asset(path)
-                if path == "/favicon.ico":
-                    self.send_response(204)
-                    self.send_header("Content-Length", "0")
-                    self.end_headers()
-                    return
-                if path == "/api/projects":
-                    return self.api_projects()
-                if path == "/api/status":
-                    return self.api_status()
-                if path == "/api/completeness":
-                    return self.api_completeness()
-                if path == "/api/script":
-                    return self.api_script()
-                if path == "/api/chapters":
-                    return self.api_chapters()
-                if path == "/api/storyboard":
-                    return self.api_storyboard()
-                if path == "/api/scenes":
-                    return self.api_scenes()
-                if path == "/api/reset/preview":
-                    return self.api_reset_preview()
-                if path == "/api/queue":
-                    return self.api_queue()
-                if path == "/api/assets":
-                    return self.api_assets()
-                if path == "/api/props":
-                    return self.api_props()
-                if path == "/api/shots":
-                    return self.api_shots()
-                if path == "/api/log":
-                    return self.api_log()
-                if path == "/api/chars":
-                    return self.api_chars()
-                if path == "/api/shot":
-                    return self.api_shot()
-                if path == "/api/qc":
-                    return self.api_qc()
-                if path == "/api/audit":
-                    return self.api_audit()
-                if path == "/view":
-                    return self.view()
-                raise _Abort(404, "not_found", f"没有这个路径：{path}")
-            except _Abort as e:
-                self._fail(e)
-            except BrokenPipeError:
-                pass
-            except Exception as e:  # 任何异常都要变成 JSON，别让 UI 拿到半截响应
-                self._json({"ok": False, "error": "server_error", "message": f"{type(e).__name__}: {e}"}, 500)
+            self._dispatch("GET", ROUTES_GET, PREFIX_ROUTES_GET)
 
         def do_POST(self):  # noqa: N802
+            self._dispatch("POST", ROUTES_POST)
+
+        def _dispatch(self, method: str, table: dict, prefixes: dict | None = None):
+            """
+            查表分发 + 唯一的错误边界。
+
+            错误分流的纪律（S6）：
+              · _Abort 带着明确类别与状态码直接走（4xx / 409 / 502 / 503）；
+              · 任务层「已知输入错误」在各 handler 里转成 _Abort(4xx)；
+              · 其余异常 = 服务端 bug → 500 server_error，且**必须**留栈到 stderr
+                （`_log_exc`）—— 否则排障时只剩一行 message，失真。
+            """
             try:
                 path = urllib.parse.urlparse(self.path).path
-                body = self._body(MAX_UPLOAD_BODY if path == "/api/chars/upload" else MAX_BODY)
-                if path == "/api/reset":
-                    return self.api_reset(body)
-                if path == "/api/scene/update":
-                    return self.api_scene_update(body)
-                if path == "/api/prop/update":
-                    return self.api_prop_update(body)
-                if path == "/api/queue/add":
-                    return self.api_queue_add(body)
-                if path == "/api/queue/cancel":
-                    return self.api_queue_cancel(body)
-                if path == "/api/queue/clear":
-                    return self.api_queue_clear(body)
-                if path == "/api/asset/gen":
-                    return self.api_asset_gen(body)
-                if path == "/api/asset/upload":
-                    return self.api_asset_upload(body)
-                if path == "/api/asset/adopt":
-                    return self.api_asset_adopt(body)
-                if path == "/api/approve":
-                    return self.api_approve(body)
-                if path == "/api/run":
-                    return self.api_run(body)
-                if path == "/api/stop":
-                    return self.api_stop(body)
-                if path == "/api/rerender":
-                    return self.api_rerender(body)
-                if path == "/api/chars/gacha":
-                    return self.api_chars_gacha(body)
-                if path == "/api/chars/adopt":
-                    return self.api_chars_adopt(body)
-                if path == "/api/chars/upload":
-                    return self.api_chars_upload(body)
-                if path == "/api/chars/prompt":
-                    return self.api_chars_prompt(body)
-                # P1：镜头编辑（全部走 taskctl，Web 自己不做业务逻辑）
-                if path == "/api/shot/lock":
-                    return self.api_shot_lock(body)
-                if path == "/api/shot/update":
-                    return self.api_shot_update(body)
-                if path == "/api/shot/rewrite":
-                    return self.api_shot_rewrite(body)
-                if path == "/api/shot/split":
-                    return self.api_shot_split(body)
-                if path == "/api/shot/merge":
-                    return self.api_shot_merge(body)
-                if path == "/api/shot/insert":
-                    return self.api_shot_insert(body)
-                if path == "/api/shot/delete":
-                    return self.api_shot_delete(body)
-                if path == "/api/shot/undo":
-                    return self.api_shot_undo(body)
-                if path == "/api/shots/bulk":
-                    return self.api_shots_bulk(body)
-                if path == "/api/shots/renumber":
-                    return self.api_shots_renumber(body)
-                raise _Abort(404, "not_found", f"没有这个路径：{path}")
+                name = table.get(path)
+                if name is None and prefixes:
+                    for pre, pname in prefixes.items():
+                        if path.startswith(pre):
+                            name = pname
+                            break
+                if name is None:
+                    raise _Abort(404, "not_found", f"没有这个路径：{path}")
+                if method == "POST":
+                    return getattr(self, name)(self._body(BODY_LIMITS.get(path)))
+                return getattr(self, name)()
             except _Abort as e:
                 self._fail(e)
             except BrokenPipeError:
                 pass
-            except Exception as e:
+            except _CLIENT_ERRORS as e:
+                # 已知输入错误的漏网之鱼（handler 没显式映射的 TaskError/ValueError
+                # 等）仍然是「请求不对」→ 4xx 人话，不能混进 500 冒充服务端故障
+                self._fail(_Abort(400, "bad_request", str(e)))
+            except Exception as e:  # 任何异常都要变成 JSON，别让 UI 拿到半截响应
+                _log_exc(f"{method} {self.path}")
                 self._json({"ok": False, "error": "server_error", "message": f"{type(e).__name__}: {e}"}, 500)
+
+        # -- 页面/静态
+
+        def page_index(self):
+            # Vue 产物优先；没有就回退旧单文件
+            page = DIST_INDEX if DIST_INDEX.is_file() else INDEX_HTML
+            text = page.read_text(encoding="utf-8") if page.is_file() else _FALLBACK_HTML
+            return self._html(text)
+
+        def page_favicon(self):
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def page_asset(self):
+            return self._static_asset(urllib.parse.urlparse(self.path).path)
 
         # -- API 实现
 
@@ -518,6 +648,8 @@ def make_handler(projects_root: Path, default_project: str | None = None):
                 try:
                     s["progress"] = taskctl.derive_progress(n, s.get("task_stage") or "all", projects_root)
                 except Exception:
+                    # 单个项目进度推导失败不该拖垮整个列表，但要留栈 —— 静默给 0 会骗人
+                    _log_exc(f"derive_progress({n})")
                     s["progress"] = {"pct": 0, "done": 0, "total": 0, "label": ""}
                 items.append(s)
             self._json({"ok": True, "root": str(projects_root), "default": default_project or (names[0] if names else ""), "projects": items})
@@ -624,20 +756,38 @@ def make_handler(projects_root: Path, default_project: str | None = None):
                 raise _Abort(400, "bad_kind", str(e)) from e
 
             # 队列是"入队即完事"，但 drainer 得有人跑 —— 空闲就起一个。
+            # ★ _start 只干活不发响应（发响应是本 handler 的事），这里只取结果。
             started = False
+            approval = None
             try:
                 cur = taskctl.read_task(Path(projects_root) / name)
                 if not taskctl.task_running(cur):
-                    self._start({"project": name, "stage": "queue"}, only=[], quiet=True)
+                    self._start({"project": name, "stage": "queue"}, only=[])
                     started = True
+            except _Abort as e:
+                # 唤醒失败不阻断入队（作业已落盘不会丢）。**但预算拦截要透传**：
+                # NeedsApproval 的结构化载荷必须带给 UI 弹审批框 —— 折成一句
+                # start_error 的话用户看不到审批框，队列就永远停在那（S4 闭环缺口）。
+                started = False
+                start_err = f"{e.error}: {e.message}"
+                if e.code == 409 and (e.extra or {}).get("needs_approval"):
+                    approval = e.extra
             except Exception as e:                              # noqa: BLE001
+                # 唤醒 drainer 失败不阻断入队（作业已落盘不会丢），但必须留栈
+                _log_exc("queue/add 唤醒 drainer")
                 started = False
                 start_err = f"{type(e).__name__}: {e}"
             st = Q.stats(proj)
-            self._json({"ok": True, "job": job.to_dict(), "started_worker": started,
-                        "start_error": start_err, "pending": st["pending"],
-                        "message": f"已入队：{job.label}（队列 {st['pending']} 项）"
-                                   + ("" if started else "，worker 已在跑")})
+            out = {"ok": True, "job": job.to_dict(), "started_worker": started,
+                   "start_error": start_err, "pending": st["pending"],
+                   "message": f"已入队：{job.label}（队列 {st['pending']} 项）"
+                              + ("" if started else "，worker 已在跑")}
+            if approval:
+                # 结构化透传（**只加字段不改既有字段**）：UI 拿 needs_approval 载荷
+                # 直接弹审批框（载荷自带 已花/卡在哪/再放行多少 三问的答案）
+                out["needs_approval"] = approval
+                out["message"] += "；预算超出，「放行」一次后队列继续"
+            self._json(out)
 
         def api_queue_cancel(self, body: dict):
             """POST /api/queue/cancel：取消待处理作业（正在跑的那个要按「停止」）。"""
@@ -697,7 +847,8 @@ def make_handler(projects_root: Path, default_project: str | None = None):
                     self._start({"project": name, "stage": "queue"}, only=[])
                     started = True
             except Exception:                               # noqa: BLE001
-                pass
+                # 唤醒 drainer 失败不能整个吞掉 —— 留栈，作业还在队列里不会丢
+                _log_exc("asset/gen 唤醒 drainer")
             st = Q.stats(proj)
             self._json({"ok": True, "job": job.to_dict(), "started_worker": started,
                         "pending": st["pending"],
@@ -719,8 +870,11 @@ def make_handler(projects_root: Path, default_project: str | None = None):
                 r = taskctl.asset_upload(name, kind, aid,
                                          str(body.get("filename") or "upload.png"),
                                          raw, projects_root)
-            except Exception as e:                      # noqa: BLE001
-                raise _Abort(400, "upload_failed", f"{type(e).__name__}: {e}") from e
+            except _CLIENT_ERRORS as e:
+                # 已知输入错误（参数/内容不合法）→ 4xx 人话；
+                # 其余异常（磁盘、代码缺陷）**不在此折叠** —— 冒到 _dispatch 兜底
+                # 变 500 + 留栈，服务端 bug 不再伪装成「请求错误」。
+                raise _Abort(400, "upload_failed", str(e)) from e
             self._json({"ok": True, **r})
 
         def api_asset_adopt(self, body: dict):
@@ -732,7 +886,8 @@ def make_handler(projects_root: Path, default_project: str | None = None):
                 r = taskctl.asset_adopt(name, str(body.get("kind") or ""),
                                         str(body.get("id") or ""),
                                         str(body.get("file") or ""), projects_root)
-            except Exception as e:                      # noqa: BLE001
+            except _CLIENT_ERRORS as e:
+                # 同 upload：已知输入错误 → 4xx；服务端故障不折叠，走 500 + 留栈
                 raise _Abort(400, "asset_adopt_failed", str(e)) from e
             self._json({"ok": True, **r})
 
@@ -750,11 +905,58 @@ def make_handler(projects_root: Path, default_project: str | None = None):
             name = self._project_arg(q)
             stage = str(q.get("stage") or "all")
             from vm import budget as B
-            est = B.estimate(name, stage, root=projects_root)
-            chk = B.check(name, est)
+            # 预算模块按「项目目录」定位（它自己 resolve_project 用默认根目录，
+            # 不知道 web 的 projects_root 口径）—— 先解析成绝对路径再交给它，
+            # 免得 serve 挂在非默认根目录时预算读到别的项目去。
+            pdir = taskctl.resolve_project(name, projects_root)
+            est = B.estimate(pdir, stage)
+            chk = B.check(pdir, est)
             self._json({"ok": True, "est": est, "check": chk,
-                        "budget": B.budget_of(name),
-                        "spent": B.spent(Path(projects_root) / name)})
+                        "budget": B.budget_of(pdir),
+                        "spent": B.spent(pdir)})
+
+        # -- 配置中心（T3）：handler 只做参数校验 + 错误映射，业务全部在 vm/config.py
+
+        def api_config(self):
+            """GET /api/config?project=X：全部配置项 + 各层值（继承/覆盖标记）+ 说明文案。
+
+            project 可省略（只看全局层）。**永远不含 API Key** —— 只报 api_key_present。
+            """
+            q = self._query()
+            name = str(q.get("project") or default_project or "")
+            self._json({"ok": True, **vm_config.get_config(name or None, projects_root)})
+
+        def api_config_save(self, body: dict):
+            """POST /api/config：保存配置改动。
+
+            body: {project, changes: [{key, layer, value}], confirm_impact?}
+            value=null = 从该层删除（一键恢复继承）；危险项（进镜头指纹）改动
+            未 confirm_impact 时不落盘，返回 needs_confirm=true + 影响清单让人确认。
+            """
+            name = str(body.get("project") or default_project or "")
+            changes = body.get("changes")
+            if not isinstance(changes, list):
+                raise _Abort(400, "bad_request",
+                             "changes 必须是数组：[{key, layer, value}]（value=null 表示恢复继承）")
+            try:
+                out = vm_config.save_config(
+                    name or None, changes, root=projects_root,
+                    confirm_impact=bool(body.get("confirm_impact")),
+                )
+            except vm_config.ConfigError as e:
+                raise _Abort(400, "config_invalid", str(e), issues=e.errors) from e
+            self._json({"ok": True, **out})
+
+        def api_config_validate(self, body: dict):
+            """POST /api/config/validate：保存前预检 —— schema 校验 + ComfyUI 连通 /
+            模型文件 / 字体 / ffmpeg / API Key 是否就位 + 危险项影响清单。"""
+            name = str(body.get("project") or default_project or "")
+            values = body.get("values") if isinstance(body.get("values"), dict) else {}
+            try:
+                self._json({"ok": True,
+                            **vm_config.validate_bundle(name or None, values, root=projects_root)})
+            except vm_config.ConfigError as e:
+                raise _Abort(400, "config_invalid", str(e), issues=e.errors) from e
 
         def api_approve(self, body: dict):
             """POST /api/approve：放行**一次**（下一个任务消费掉即失效，防永久放行）。"""
@@ -762,7 +964,11 @@ def make_handler(projects_root: Path, default_project: str | None = None):
             if not name:
                 raise _Abort(400, "no_project", "请求里必须带 project")
             from vm import budget as B
-            r = B.grant_approval(name, by="user", stage=str(body.get("stage") or ""),
+            # ★ 必须传「被服务的项目」的绝对路径（BUG-2 尾巴）：只传裸项目名时
+            #   budget._pdir 会拿**默认 projects 根**去解析 —— serve 挂自定义根
+            #   （测试/多根）时放行记录写到别的项目去，审批永远不生效。
+            pdir = taskctl.resolve_project(name, projects_root)
+            r = B.grant_approval(pdir, by="user", stage=str(body.get("stage") or ""),
                                  note=str(body.get("note") or ""))
             self._json({"ok": True, **r,
                         "message": "已放行一次；下一个任务消费后即失效"})
@@ -894,24 +1100,50 @@ def make_handler(projects_root: Path, default_project: str | None = None):
 
         def api_shot_lock(self, body: dict):
             """
-            E1：锁定 / 解锁 / 选中 / 收藏一个镜头。
+            E1：锁定 / 解锁 / 选中 / 收藏。单镜传 `id`，批量传 `ids`（数组）。
 
             为什么要有这个：在此之前**任何产物都能被覆盖** —— 改定妆照、批量重渲、
             重跑渲染，都可能把一个你已经满意的镜头盖掉且无任何提示。
             锁定后渲染层会跳过它（`gen.render_shot` 里检查 `manifest.is_locked`），
             只有显式 force 才能动。
+
+            ★ 无产物镜头**优雅跳过**（lead 裁决）：单镜 200 + locked:false + 人话 note；
+            批量调用里同类镜头进响应 `skipped` 列表 —— 批量操作不因个别项炸掉。
             """
             name = self._shot_body_project(body)
-            sid = self._shot_id_arg(body)
-            self._shot_call(
-                lambda: taskctl.set_shot_flag(
-                    name, sid,
-                    str(body.get("flag") or "locked"),
-                    bool(body.get("value", True)),
-                    projects_root,
-                    by=str(body.get("by") or "user"),
-                )
-            )
+            flag = str(body.get("flag") or "locked")
+            value = bool(body.get("value", True))
+            by = str(body.get("by") or "user")
+            ids_raw = body.get("ids")
+
+            def _one(sid: str) -> dict:
+                return taskctl.set_shot_flag(name, sid, flag, value, projects_root, by=by)
+
+            if ids_raw is None:
+                # 单镜：原样透出（含 skipped/note —— 无产物不再 400）
+                self._shot_call(lambda: _one(self._shot_id_arg(body)))
+                return
+            if not isinstance(ids_raw, list) or not ids_raw:
+                raise _Abort(400, "bad_shot", "ids 必须是非空的镜头号数组")
+
+            def _bulk() -> dict:
+                updated: list[str] = []
+                skipped: list[str] = []
+                notes: list[str] = []
+                for x in ids_raw:
+                    r = _one(str(x))
+                    (skipped if r.get("skipped") else updated).append(r["shot"])
+                    if r.get("note"):
+                        notes.append(f"{r['shot']}：{r['note']}")
+                return {
+                    "updated": updated,
+                    "skipped": skipped,
+                    "notes": notes,
+                    "message": f"已处理 {len(ids_raw)} 镜：成功 {len(updated)} 镜"
+                               + (f"，跳过 {len(skipped)} 镜（无产物记录）" if skipped else ""),
+                }
+
+            self._shot_call(_bulk)
 
         def api_shot_update(self, body: dict):
             name = self._shot_body_project(body)
@@ -997,8 +1229,10 @@ def make_handler(projects_root: Path, default_project: str | None = None):
             if q.get("kind"):
                 src, ctype, thumb_key = _resolve_view_target(proj, q.get("kind", ""), q.get("name", ""), q.get("file", ""))
                 if q.get("thumb"):
-                    tp = _make_thumb(proj, thumb_key, src)
+                    tp, pending = _thumb_request(proj, thumb_key, src)
                     if tp is None:
+                        if pending:
+                            return self._thumb_placeholder()
                         raise _Abort(500, "thumb_failed", "缩略图生成失败（ffmpeg 不可用或文件损坏）")
                     return self._file(tp, "image/jpeg")
                 return self._file(src, ctype, download=bool(q.get("download")))
@@ -1006,11 +1240,27 @@ def make_handler(projects_root: Path, default_project: str | None = None):
             shot = q.get("shot") or ""
             clip = _resolve_shot_clip(proj, shot)
             if q.get("thumb"):
-                tp = _make_thumb(proj, shot, clip)
+                tp, pending = _thumb_request(proj, shot, clip)
                 if tp is None:
+                    if pending:
+                        return self._thumb_placeholder()
                     raise _Abort(500, "thumb_failed", "缩略图生成失败（ffmpeg 不可用或该片段无法解码）")
                 return self._file(tp, "image/jpeg")
             return self._file(clip, "video/mp4", download=bool(q.get("download")))
+
+        def _thumb_placeholder(self) -> None:
+            """
+            缩略图还在后台生成 → 先回占位图 + `X-Thumb-Pending: 1`。
+            no-store 是硬要求：占位图绝不能进缓存，否则前端重试拿到的还是它。
+            前端约定（可选优化）：看到 X-Thumb-Pending 就延迟 2~3s 换 URL（&t=时间戳）重试。
+            """
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(_PLACEHOLDER_JPEG)))
+            self.send_header("X-Thumb-Pending", "1")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(_PLACEHOLDER_JPEG)
 
         # -- R2：角色定妆 / 抽卡 / 采纳 ------------------------------------
 
@@ -1050,7 +1300,7 @@ def make_handler(projects_root: Path, default_project: str | None = None):
             if not 1 <= n <= 24:
                 raise _Abort(400, "bad_count", f"抽卡张数要在 1~24 之间，收到 {n}")
             # 走统一任务模型：进度/日志/停止/并发锁与 render 完全一样
-            self._start({"project": name, "stage": "gacha", "count": n}, only=[char], force=False)
+            self._json(self._start({"project": name, "stage": "gacha", "count": n}, only=[char], force=False))
 
         def api_chars_adopt(self, body: dict):
             name = str(body.get("project") or default_project or "")
@@ -1117,8 +1367,10 @@ def make_handler(projects_root: Path, default_project: str | None = None):
             lines: list[str] = []
             try:
                 chars_mod.adopt_candidate(Project(pdir), char, src, params, lines.append)
-            except Exception as e:
-                raise _Abort(400, "adopt_failed", f"采纳失败：{type(e).__name__}: {e}") from e
+            except _CLIENT_ERRORS as e:
+                # 已知输入错误（候选图不存在等）→ 4xx；
+                # 其余（磁盘故障、ComfyUI input 同步炸）不折叠成 400，走 500 + 留栈
+                raise _Abort(400, "adopt_failed", f"采纳失败：{e}") from e
             after = taskctl.file_digest16(ref)
             # 采纳后立刻重算三态：参考图 mtime 变了 → 用到该角色的镜头自动变 stale/缺失
             stale: list[str] = []
@@ -1127,6 +1379,9 @@ def make_handler(projects_root: Path, default_project: str | None = None):
                 stale = [s["id"] for s in t["shots"]
                          if char in (s.get("chars") or []) and s["status"] != taskctl.CURRENT]
             except Exception:
+                # 这里吞异常是刻意的（采纳已成功，不能因重算 stale 而回滚响应），
+                # 但必须留栈 —— 否则"stale 列表为空"会静默骗人
+                _log_exc("shot_table（采纳后重算 stale）")
                 stale = []
             running = taskctl.task_running(taskctl.read_task(project, projects_root))
             res = {
@@ -1144,8 +1399,14 @@ def make_handler(projects_root: Path, default_project: str | None = None):
                 res["warning"] = "有任务正在运行：新参考图会影响之后的提交，但已经在跑的那一镜仍用旧图"
             return res
 
-        def _start(self, body: dict, *, stage_default: str | None = None, only=None, force=None,
-                   quiet: bool = False):
+        def _start(self, body: dict, *, stage_default: str | None = None, only=None, force=None) -> dict:
+            """
+            启动任务，**只干活、只返回载荷，不发响应** —— 发响应是调用方的统一职责。
+
+            （原来是 quiet 开关的双响应 hack：漏传 quiet 就一个请求发两次响应，
+             第二个响应在连接复用时被当响应体读到 → 前端表现为卡死。现在结构上
+             不存在"发一次还是发两次"的选择题。）
+            """
             name = str(body.get("project") or default_project or "")
             if not name:
                 raise _Abort(400, "no_project", "请求里必须带 project")
@@ -1189,7 +1450,7 @@ def make_handler(projects_root: Path, default_project: str | None = None):
             except taskctl.TaskError as e:
                 raise _Abort(400, "bad_request", str(e)) from e
             task = h.public()
-            out = {
+            return {
                 "ok": True,
                 "message": f"已启动：{name} / {stage} / pid={h.pid}",
                 "pid": h.pid,
@@ -1198,22 +1459,15 @@ def make_handler(projects_root: Path, default_project: str | None = None):
                 "only": task.get("only") or [],
                 "started_at": task.get("started_at"),
             }
-            # quiet=True：**只干活不发响应**。给那些"启动任务之后还要再发自己的载荷"的
-            # 调用方用（例如 /api/queue/add 要先起 drainer、再把队列信息返回）。
-            # ⚠️ 不加这个开关就会**一个请求发两次响应** —— 第一个响应浏览器读得走，
-            #    第二个照样写进 socket；连接复用时读到脏数据，前端表现为**卡死**。
-            if not quiet:
-                self._json(out, 200)
-            return out
 
         def api_run(self, body: dict):
-            self._start(body)
+            self._json(self._start(body))
 
         def api_rerender(self, body: dict):
             shot = str(body.get("shot_id") or body.get("shot") or "").strip()
             if not SHOT_RE.match(shot):
                 raise _Abort(400, "bad_shot", f"非法镜头号：{shot!r}")
-            self._start({**body, "stage": "render"}, only=[shot], force=True)
+            self._json(self._start({**body, "stage": "render"}, only=[shot], force=True))
 
         def api_stop(self, body: dict):
             name = str(body.get("project") or default_project or "")
@@ -1228,6 +1482,8 @@ def make_handler(projects_root: Path, default_project: str | None = None):
                         "pid": r.get("pid", 0), "alive": r.get("alive"),
                         "signal": r.get("signal", ""), "target": r.get("target", "")}, code)
 
+    # 启动自检：漏注册/表项悬空直接在这里炸掉 —— 服务起不来，胜过线上 404
+    _verify_routes(Handler)
     return Handler
 
 

@@ -134,6 +134,8 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { ElButton, ElInputNumber, ElMessage, ElTag } from 'element-plus'
 import ImgUpload from '@/components/ImgUpload.vue'
 import { api } from '@/api/client'
+import { confirmAction } from '@/composables/confirmAction'
+import { requestBudgetApproval } from '@/composables/budgetApproval'
 import type { CharCandidate, CharRow } from '@/api/types'
 import { fmtSize, refreshChars, refreshShots, refreshStatus, state } from '@/stores/app'
 
@@ -181,7 +183,23 @@ async function load(force = false) {
 
 async function gacha(c: CharRow) {
   const n = Number(counts[c.name] ?? 2) || 2
-  if (!window.confirm(`给「${c.name}」抽 ${n} 张候选？\n（GPU 任务，约每张 40 秒；已存在的 seed 会自动跳过）`)) return
+  // 统一确认（U10）：confirmAction 永不 reject，取消直接返回 false
+  const ok = await confirmAction({
+    title: `给「${c.name}」抽卡`,
+    message: `抽 ${n} 张候选？\n（GPU 任务，约每张 40 秒；已存在的 seed 会自动跳过）`,
+    confirmText: '开始抽卡',
+  })
+  if (!ok) return
+  await runGacha(c, n, false)
+}
+
+/**
+ * 抽卡本体（可重试一次）：T2 把抽卡纳入预算护栏后，超预算会回 409 + needs_approval
+ * —— 这里接 E3 审批框（requestBudgetApproval：已花 / 卡在哪 / 再放行多少），
+ * 批准 = 放行一次并重试原动作；拒绝或非预算错误就照常报错。
+ * 与 AssetCandidates 的抽卡入口同一套接线（照抄其 enqueue 的重试语义）。
+ */
+async function runGacha(c: CharRow, n: number, retried: boolean): Promise<void> {
   try {
     const r = await api.gacha(state.project, c.name, n)
     ElMessage.success(r.message || `已启动「${c.name}」抽卡（${n} 张），进度见「日志」tab`)
@@ -190,6 +208,10 @@ async function gacha(c: CharRow) {
     } catch { /* 状态刷新失败不影响抽卡已启动这一事实 */ }
     await load(true)
   } catch (e) {
+    if (!retried && (await requestBudgetApproval(e, state.project, 'gacha')) === 'approved') {
+      await runGacha(c, n, true)
+      return
+    }
     ElMessage.error(`抽卡启动失败：${(e as Error).message}`)
   }
 }
@@ -203,7 +225,14 @@ async function adopt(c: CharRow, cand: CharCandidate) {
     ElMessage.warning('这张候选没有文件名，无法采纳')
     return
   }
-  if (!window.confirm(`采纳 ${file} 作为「${c.name}」的定妆照？\n已生成的相关镜头会被标成「需重渲」。`)) return
+  // 统一确认（U10）：把后果说清 —— 采纳会让相关镜头变「需重渲」
+  const ok = await confirmAction({
+    title: '采纳定妆照',
+    message: `采纳 ${file} 作为「${c.name}」的定妆照？\n已生成的相关镜头会被标成「需重渲」。`,
+    list: [file],
+    confirmText: '采纳',
+  })
+  if (!ok) return
   try {
     const r = await api.adopt(state.project, c.name, file)
     const stale = strList(r.stale_shots)
@@ -274,7 +303,7 @@ async function uploadPortrait(name: string, filename: string, b64: string) {
   object-fit: cover;
   border-radius: var(--radius-sm);
   border: 2px solid var(--line);
-  background: #eef0f3;
+  background: var(--surface-3);
   flex: 0 0 auto;
 }
 .charhead .ph-ref {
@@ -285,7 +314,7 @@ async function uploadPortrait(name: string, filename: string, b64: string) {
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #8b93a1;
+  color: var(--text-4);
   font-size: 11px;
   text-align: center;
   flex: 0 0 auto;
@@ -310,8 +339,8 @@ async function uploadPortrait(name: string, filename: string, b64: string) {
   font: 11.5px/1.5 ui-monospace, Menlo, Consolas, monospace;
   white-space: pre-wrap;
   word-break: break-word;
-  color: #4b5563;
-  background: #fcfdfe;
+  color: var(--text-2);
+  background: var(--surface-2);
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
 }
@@ -321,8 +350,8 @@ async function uploadPortrait(name: string, filename: string, b64: string) {
   border-radius: var(--radius-sm);
   font-size: 11.5px;
   line-height: 1.6;
-  background: color-mix(in srgb, var(--warn) 10%, #fff);
-  border: 1px solid color-mix(in srgb, var(--warn) 28%, #fff);
+  background: color-mix(in srgb, var(--warn) 10%, var(--card));
+  border: 1px solid color-mix(in srgb, var(--warn) 28%, var(--card));
   color: var(--warn);
 }
 .charrow {
@@ -345,7 +374,7 @@ async function uploadPortrait(name: string, filename: string, b64: string) {
   border: 2px solid var(--line);
   border-radius: var(--radius-sm);
   overflow: hidden;
-  background: #fff;
+  background: var(--card);
 }
 .cand.adopted {
   border-color: var(--ok);
@@ -380,7 +409,7 @@ async function uploadPortrait(name: string, filename: string, b64: string) {
 .promptedit {
   width: 100%; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px;
   line-height: 1.5; border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px;
-  resize: vertical; color: #374151; margin-top: 4px;
+  resize: vertical; color: var(--text-3); margin-top: 4px;
 }
 .perow { display: flex; align-items: center; gap: 7px; margin-top: 4px; flex-wrap: wrap; }
 .pebtn {

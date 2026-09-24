@@ -44,6 +44,17 @@ COST = {
     "chars_sec_per_run": 41.8 * 2,  # 定妆：每角色一次 T2VA 出图 + 抽帧
 }
 
+# ── 队列作业单价表（键 = vm/queue.py 的 JOB_KINDS）──────────────────────────
+# 为什么要有：B2 实锤「抽卡不设防」—— gacha 单价 0、估算里还有 `COST[...] * 0`
+# 死代码，连点 24 张抽卡烧 GPU 但护栏永远不响。GPU 出口必须**每个**都有单价：
+# 抽卡（chars_gacha）按 chars_sec_per_run × 张数（任务书 S4 指定口径，宁可略高估 ——
+# 护栏高估只是多问一次"批不批"，低估才是失职）。
+JOB_UNIT_GPU_SEC: dict[str, float] = {
+    "asset_gen":   COST["qwen_sec_per_shot"],   # 场景/道具概念图：Qwen-Image ~10s/张
+    "chars_gacha": COST["chars_sec_per_run"],   # 角色抽卡：每张一次 T2VA 出图 + 抽帧
+    "storyboard":  COST["qwen_sec_per_shot"],   # 分镜图：Qwen-Image ~10s/张
+}
+
 # 每个阶段的成本构成：(描述, 单位数从哪来)
 #   "shots"  = 涉及的镜头数
 #   "chars"  = 涉及的角色数
@@ -51,6 +62,8 @@ COST = {
 STAGE_COST: dict[str, dict] = {
     "plan":      {"gpu_sec_per_shot": 0.0,               "llm_calls": 3,  "per_shot_llm": 0.06},
     "chars":     {"gpu_sec_per_shot": 0.0,               "llm_calls": 1},
+    # gacha 不按镜头数计价（only 给的是角色名），走 JOB_UNIT_GPU_SEC 的早退分支；
+    # 这里 0 只是占位，别再往这个键上加单价（B2 的根因之一）
     "gacha":     {"gpu_sec_per_shot": 0.0,               "llm_calls": 0},
     "render":    {"gpu_sec_per_shot": COST["h3_sec_per_shot"], "llm_calls": 0},
     "qc":        {"gpu_sec_per_shot": 0.0,               "llm_calls": 0},
@@ -116,30 +129,57 @@ def estimate(project: str | Path, stage: str, *, only: list[str] | None = None,
     pdir = _pdir(project)
     proj = Project(pdir)
 
-    # ── 队列 drainer 要单独算（2026-09-24 修）────────────────────────────────
+    # ── 队列 drainer 要单独算（2026-09-24 修，2026-09-25 起按 JOB_KINDS 计价）──
     # `stage="queue"` 不是"把整个项目渲一遍"，它是**抽卡队列**：跑几张小图
     # （Qwen-Image ~10s/张）。原来它走到下面的 `STAGE_COST.get("queue", render)`
     # → 按全项目 31 镜视频估成 **21.6 分钟** → 超过预算 → 抛 NeedsApproval →
     # **drainer 永远起不来**，队列一直 pending。
-    # 实测表现：西游记（没配预算）正常，雨夜地铁（配了预算）卡死。
+    # 修法是按作业真实单价估（B2/S4）：每类作业 `JOB_UNIT_GPU_SEC × 张数(n)` ——
+    # 既不再高估到卡死 drainer，也不让抽卡类 GPU 出口逃过护栏。
     if stage == "queue":
         from vm import queue as _Q
-        st = _Q.stats(proj)
-        pend = st.get("pending", 0)
         jobs = [j for j in (_Q.read_all(proj)) if j.status == "pending"]
-        # 按作业类型分别估：素材图 / 角色定妆走 Qwen-Image；分镜图也是 Qwen-Image
-        gpu_sec = float(COST.get("qwen_sec_per_shot", 10.0)) * max(1, pend)
+        pend = len(jobs)
+        gpu_sec = 0.0
+        for j in jobs:
+            unit = JOB_UNIT_GPU_SEC.get(j.kind, COST["qwen_sec_per_shot"])
+            gpu_sec += unit * max(1, int(j.args.get("n") or 1))
         return {
             "schema": 1, "stage": "queue", "shots": 0, "shots_pending": pend,
             "gpu_sec": round(gpu_sec, 1), "gpu_min": round(gpu_sec / 60.0, 2),
             "llm_calls": 0, "llm_tokens": 0,
             "jobs_pending": pend,
             "job_kinds": sorted({j.kind for j in jobs}),
-            "note": f"{pend} 个排队作业（抽卡类，Qwen-Image ~{COST.get('qwen_sec_per_shot', 10):.0f}s/张）",
-            "baseline": "实测：Qwen-Image 10.0s/张",
+            "note": f"{pend} 个排队作业（按作业类型单价估算："
+                    + "、".join(f"{k} {JOB_UNIT_GPU_SEC.get(k, COST['qwen_sec_per_shot']):.0f}s/张"
+                                 for k in sorted({j.kind for j in jobs}))
+                    + "）",
+            "baseline": "实测基线，按 JOB_UNIT_GPU_SEC 逐作业累加",
         }
 
     all_shots = load_shots_dir(proj.shots_dir)
+
+    # ── 抽卡（gacha）按「张数」计价，不按镜头数（B2 修复）──────────────────
+    # gacha 的 only 给的是**角色名**（不是镜头号）：走下面的镜头口径会滤成 0 镜
+    # → 成本恒 0 → 连点 24 张抽卡永不触发护栏。这里单独计价：
+    # `chars_sec_per_run × 总张数`（每角色 count 张；count=0 用默认张数）。
+    if stage == "gacha":
+        from vm.taskctl import DEFAULT_GACHA_COUNT
+        names = [str(x) for x in (only or [])] or sorted({c for s in all_shots for c in (s.chars or [])})
+        per = int(count) if count else DEFAULT_GACHA_COUNT
+        cards = len(names) * max(1, per)
+        unit = JOB_UNIT_GPU_SEC["chars_gacha"]
+        gpu_sec = unit * cards
+        return {
+            "stage": "gacha", "shots": 0, "shots_pending": 0, "chars": len(names),
+            "cards": cards,
+            "gpu_sec": round(gpu_sec, 1), "gpu_min": round(gpu_sec / 60, 1),
+            "llm_calls": 0, "llm_tokens": 0,
+            "wall_min": round(gpu_sec / 60, 1),
+            "baseline": COST,
+            "note": f"抽卡 {len(names)} 角色 × {per} 张 = {cards} 张（{unit:.1f}s/张）",
+        }
+
     if only:
         ids = set(only)
         shots = [s for s in all_shots if s.id in ids]
@@ -162,8 +202,11 @@ def estimate(project: str | Path, stage: str, *, only: list[str] | None = None,
         gpu += COST["chars_sec_per_run"] * max(0, n_chars)
     llm_calls = int(spec.get("llm_calls") or 0) + int((spec.get("per_shot_llm") or 0) * n)
     if count:
-        gpu += COST["qwen_sec_per_shot"] * 0  # gacha 的张数由 count 决定
-        gpu += float(spec.get("gpu_sec_per_shot") or 0) * max(0, count - 1)
+        # count = 本次附带的抽卡候选张数 —— **每张都是一个 GPU 出口**，必须计价
+        # （B2 验收闸：「count 张候选要进 estimate 的 gpu 估算」）。
+        # 按 JOB_KINDS 的抽卡单价计；原来这里是 `COST[...] * 0` 死代码 + 按
+        # gpu_sec_per_shot 的怪算式（gacha 单价为 0 → 恒 0），已废。
+        gpu += JOB_UNIT_GPU_SEC["chars_gacha"] * max(0, int(count))
 
     return {
         "stage": stage,
@@ -175,6 +218,35 @@ def estimate(project: str | Path, stage: str, *, only: list[str] | None = None,
         "llm_calls": llm_calls,
         "llm_tokens": llm_calls * COST["llm_tokens_per_call"],
         "wall_min": round((gpu + llm_calls * 3) / 60, 1),
+        "baseline": COST,
+    }
+
+
+def job_estimate(job: Any) -> dict:
+    """
+    单个队列作业的估算 —— drainer 逐作业过 `check()` 用（S4：护栏罩住全部 GPU 出口）。
+
+    传 vm/queue.Job 对象或同形 dict（{"kind":…, "args":{…}}）。
+    单价 × 张数（args.n，缺省 1）。返回结构与 estimate() 同键，
+    `stage` 写成 `queue:<kind>`，超预算时审批框能看出卡在哪种作业上。
+    """
+    get = (lambda k, d=None: getattr(job, k, d)) if not isinstance(job, dict) else (lambda k, d=None: job.get(k, d))
+    kind = str(get("kind") or "")
+    args = get("args") or {}
+    args = args if isinstance(args, dict) else {}
+    unit = JOB_UNIT_GPU_SEC.get(kind, COST["qwen_sec_per_shot"])
+    try:
+        n = max(1, int(args.get("n") or 1))
+    except (TypeError, ValueError):
+        n = 1
+    gpu_sec = unit * n
+    return {
+        "stage": f"queue:{kind}" if kind else "queue",
+        "shots": 0, "shots_pending": 0, "chars": 0,
+        "jobs": 1, "cards": n,
+        "gpu_sec": round(gpu_sec, 1), "gpu_min": round(gpu_sec / 60, 1),
+        "llm_calls": 0, "llm_tokens": 0,
+        "wall_min": round(gpu_sec / 60, 1),
         "baseline": COST,
     }
 

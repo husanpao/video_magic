@@ -97,8 +97,8 @@ watch(
   border-radius: var(--radius-sm);
   font-size: 11.5px;
   line-height: 1.6;
-  background: color-mix(in srgb, var(--warn) 10%, #fff);
-  border: 1px solid color-mix(in srgb, var(--warn) 28%, #fff);
+  background: color-mix(in srgb, var(--warn) 10%, var(--card));
+  border: 1px solid color-mix(in srgb, var(--warn) 28%, var(--card));
   color: var(--warn);
 }
 </style>

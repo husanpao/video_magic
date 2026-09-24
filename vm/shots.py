@@ -173,24 +173,57 @@ def timeline_sec(s) -> float:
     return 0.0
 
 
-def seconds_to_frames(sec: float, fps: int = FPS) -> int:
+def _frame_bounds(fmin: int | None = None, fmax: int | None = None) -> tuple[int, int]:
     """
-    秒 → 对齐 17n+5 网格的帧数，clamp 到 [56,362]。
+    帧网格 clamp 上下限。缺省 = 契约冻结值 [56, 362]（不改配置时行为逐字节不变）。
+
+    T3 配置中心：机器级设置 frame_min / frame_max 由 vm/config.install() 经环境变量
+    VM_FRAME_MIN / VM_FRAME_MAX 注入（与 QI_UNET / VM_SUBTITLE_FONT 同款约定）。
+    为什么走环境变量而不是改调用方：seconds_to_frames 的调用方散在 gen.py / taskctl.py /
+    chars.py，环境变量是唯一不用逐个改它们的通道；fmin/fmax 参数留给未来显式传参的调用方。
+    非法值（不在 17n+5 网格上 / 不是整数）一律回退默认 —— 帧格错一格 H3 直接拒收，宁可保守。
+    """
+    lo, hi = FRAME_MIN, FRAME_MAX
+    for name, is_max in (("VM_FRAME_MAX", True), ("VM_FRAME_MIN", False)):
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            continue
+        try:
+            v = int(raw)
+        except ValueError:
+            continue
+        if (v - FRAME_OFFSET) % FRAME_STRIDE:  # 不在 17n+5 网格上 → 无视
+            continue
+        lo, hi = (lo, v) if is_max else (v, hi)
+    if fmin is not None:
+        lo = int(fmin)
+    if fmax is not None:
+        hi = int(fmax)
+    if hi < lo:
+        lo, hi = hi, lo
+    return lo, hi
+
+
+def seconds_to_frames(sec: float, fps: int = FPS, fmin: int | None = None,
+                      fmax: int | None = None) -> int:
+    """
+    秒 → 对齐 17n+5 网格的帧数，clamp 到 [56,362]（T3 起上限可用 frame_min/frame_max 配置）。
 
     自证（契约要求）：seconds_to_frames(5)==124、seconds_to_frames(10)==243、
     seconds_to_frames(15)==362。
     """
+    lo, hi = _frame_bounds(fmin, fmax)
     try:
         s = float(sec)
     except (TypeError, ValueError):
         s = 0.0
     if s <= 0:
-        return FRAME_MIN
+        return lo
     target = s * fps
     # 取最近网格点：round-half-up（Python 内建 round 是银行家舍入，会在这里产生
     # 0.5 帧级的不可预期抖动，破坏"同输入同输出"的可复现性）
     n = int(math.floor((target - FRAME_OFFSET) / FRAME_STRIDE + 0.5))
-    n = max(_N_MIN, min(_N_MAX, n))
+    n = max((lo - FRAME_OFFSET) // FRAME_STRIDE, min((hi - FRAME_OFFSET) // FRAME_STRIDE, n))
     return FRAME_STRIDE * n + FRAME_OFFSET
 
 

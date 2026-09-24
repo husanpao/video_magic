@@ -96,7 +96,7 @@ async function save() {
 .aebox {
   width: 100%; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px;
   line-height: 1.5; border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px;
-  resize: vertical; color: #374151;
+  resize: vertical; color: var(--text-3);
 }
 .aehint { margin-top: 4px; font-size: 10.5px; line-height: 1.5; color: var(--warn); }
 .aehint.ok { color: var(--ok); }

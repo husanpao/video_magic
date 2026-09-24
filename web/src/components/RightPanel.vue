@@ -101,7 +101,7 @@ onMounted(() => {
 .rptabs :deep(.el-tabs__header) {
   margin: 0;
   flex: 0 0 auto;
-  background: #fafbfc;
+  background: var(--surface-2);
 }
 .rptabs :deep(.el-tabs__nav-wrap) {
   padding: 0 6px;
@@ -189,7 +189,7 @@ onMounted(() => {
 .qcrow.project,
 .qcrow.project:hover {
   cursor: default;
-  background: #fcfdfe;
+  background: var(--surface-2);
 }
 .qcrow .sid {
   font-weight: 600;

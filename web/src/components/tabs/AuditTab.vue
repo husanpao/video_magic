@@ -56,6 +56,19 @@
             <span v-if="f.shot_ids.length > 1" class="small">{{ f.shot_ids.length }} 镜</span>
             <span v-if="f.chars.length" class="small">{{ f.chars.join(' / ') }}</span>
             <el-button size="small" text @click.stop="go(f)">定位</el-button>
+            <!-- ★ U6 行动闭环（2026-09-25）：finding 旁**就地修** ——
+                 直接让 AI 按这条 finding 的 rewrite_hint 重写该镜提示词，
+                 不用再自己记着镜头号跑去弹层（从看到问题到修问题零跳转）。 -->
+            <el-button
+              v-if="target(f)"
+              data-testid="btn-rewrite-prompt"
+              size="small"
+              type="warning"
+              plain
+              :loading="rwBusy === fkey(f)"
+              :title="`让 AI 按这条建议重写镜头 ${target(f)} 的六段式提示词（该镜会标「需重渲」，可在详情弹层「撤销上一步」回滚）`"
+              @click.stop="rewrite(f)"
+            >重写该镜提示词</el-button>
           </div>
           <div class="fmsg">
             {{ f.message }}
@@ -147,11 +160,17 @@
  *   位置一律用 `from_id` / `shot_ids`（镜头 id），不用 `from_shot`（表内 1-based 序号，脆弱）。
  *   `project_level === true`（from_id 为空）的 finding 单独放顶部并标「全片级」。
  *   limitations 用折叠面板展示（旧文件是默认收起的 <details>）。
+ *
+ * ★ U6 行动闭环（2026-09-25）：镜头级 finding 旁给「重写该镜提示词」直达按钮 ——
+ *   把 finding 的 `rewrite_hint` 直接当 feedback 交给 api.rewriteShot（AI 重写），
+ *   "看到问题 → 修问题"不再跨 tab 找镜头。
  */
 import { computed, onMounted, ref } from 'vue'
-import { ElButton, ElCollapse, ElCollapseItem, ElTag } from 'element-plus'
+import { ElButton, ElCollapse, ElCollapseItem, ElMessage, ElTag } from 'element-plus'
 import type { AuditFinding } from '@/api/types'
-import { refreshAudit, refreshCompleteness, state } from '@/stores/app'
+import { api } from '@/api/client'
+import { confirmAction } from '@/composables/confirmAction'
+import { refreshAudit, refreshCompleteness, refreshShots, state } from '@/stores/app'
 
 /** ★ info 必须是中性色：这些是「不可信结论的降级 + 自曝」，不是告警。 */
 const SEV: Record<AuditFinding['severity'], 'danger' | 'warning' | 'info'> = {
@@ -180,6 +199,40 @@ function target(f: AuditFinding): string {
 function go(f: AuditFinding) {
   const id = target(f)
   if (id) emit('select', id)
+}
+
+/** 行的稳定 key（loading 态按行隔离，多条 finding 可能指向同一镜）。 */
+function fkey(f: AuditFinding): string {
+  return f.code + '|' + loc(f)
+}
+
+/** U6：「重写该镜提示词」—— finding 的 rewrite_hint 直接当 feedback 交给 AI 重写。
+ *  改的是六段式提示词 → 该镜指纹变 stale（界面上会标「需重渲」），
+ *  不满意可在详情弹层「撤销上一步」回滚，所以确认框里如实说明。 */
+const rwBusy = ref('')
+async function rewrite(f: AuditFinding) {
+  const id = target(f)
+  if (!id || rwBusy.value) return
+  const hint = (f.rewrite_hint || '').trim()
+  // 统一确认（U10）：把 rewrite_hint 摆出来 —— 确认前就知道 AI 会拿到什么反馈
+  const ok = await confirmAction({
+    title: '重写该镜提示词',
+    message: `让 AI 重写镜头 ${id} 的六段式提示词？建议（会作为反馈一并传给模型）：${hint || f.message}\n改完该镜会标「需重渲」，可在详情弹层「撤销上一步」回滚。`,
+    confirmText: '重写',
+  })
+  if (!ok) return
+  rwBusy.value = fkey(f)
+  try {
+    const r = await api.rewriteShot(state.project, id, hint || f.message)
+    ElMessage.success({ message: r.message || `已重写 ${id} 的提示词（该镜现在是「需重渲」）`, duration: 6000 })
+    try {
+      await refreshShots() // 写后即刷：表格马上看到 stale，不用等轮询
+    } catch { /* 重写已成功，列表刷新失败不改变结论 */ }
+  } catch (e) {
+    ElMessage.error(`重写失败：${(e as Error).message}`)
+  } finally {
+    rwBusy.value = ''
+  }
 }
 
 async function load(force = false) {
@@ -234,19 +287,19 @@ function dimLine(key: string): string {
 .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: -1px; }
 .sw.ok { background: var(--ok); }
 .sw.warn { background: var(--warn); }
-.sw.idle { background: #d6dae0; }
-.tagbad { background: #fdeceb; color: var(--bad); font-size: 9.5px; padding: 0 5px; border-radius: 4px; }
-.tag.bad { background: #fdeceb; color: var(--bad); font-size: 9.5px; padding: 0 5px; border-radius: 4px; }
+.sw.idle { background: var(--dot-idle); }
+.tagbad { background: var(--bad-bg); color: var(--bad); font-size: 9.5px; padding: 0 5px; border-radius: 4px; }
+.tag.bad { background: var(--bad-bg); color: var(--bad); font-size: 9.5px; padding: 0 5px; border-radius: 4px; }
 .blk { color: var(--bad); font-weight: 700; margin-left: 2px; }
 /* 52×7 用固定行高 + 虚拟滚动太夸张，这里给一个限高容器让它自己滚 */
 .cmwrap { max-height: 260px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
 .cmtable { border-collapse: collapse; font-size: 10.5px; width: 100%; }
 .cmtable th {
-  position: sticky; top: 0; background: #fbfbfc; font-weight: 600; color: var(--muted);
+  position: sticky; top: 0; background: var(--surface-2); font-weight: 600; color: var(--muted);
   padding: 3px 4px; border-bottom: 1px solid var(--line); white-space: nowrap;
 }
 .cmtable td { padding: 2px 4px; border-bottom: 1px solid var(--line); text-align: center; }
-.cmtable tr.blocked { background: #fdf6f5; }
+.cmtable tr.blocked { background: var(--bad-bg); }
 .cmid { text-align: left !important; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .cmstats { margin-top: 6px; display: flex; flex-direction: column; gap: 1px; }
 </style>

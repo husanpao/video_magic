@@ -45,6 +45,7 @@ import { ElMessage } from 'element-plus'
 import { api } from '@/api/client'
 import ImgUpload from '@/components/ImgUpload.vue'
 import { assetOf, refreshAssets, refreshQueue, state } from '@/stores/app'
+import { requestBudgetApproval } from '@/composables/budgetApproval'
 
 const props = defineProps<{ kind: 'scene' | 'prop'; id: string; inline?: boolean }>()
 const busy = ref(false)
@@ -58,8 +59,15 @@ const n = computed(() => row.value?.n ?? 0)
  * 原来这里是 `await api.assetGen(...)` —— 同步 HTTP，浏览器等 20 秒、按钮禁用，
  * 用户点完一个就没法点下一个，还得一直盯着。
  * 现在入队立即返回，drainer 顺序处理；可以连点十几个然后走开。
+ *
+ * 超预算时（T2 把抽卡纳入预算护栏）回 409 + 载荷 —— 弹 E3 审批框
+ * 「已花 / 卡在哪 / 再放行多少」，批准后自动重试一次（requestBudgetApproval）。
  */
 async function gen() {
+  await enqueue()
+}
+
+async function enqueue(retried = false): Promise<void> {
   busy.value = true
   try {
     const r = await api.queueAdd(state.project, 'asset_gen', {
@@ -68,6 +76,12 @@ async function gen() {
     ElMessage.success((r.message as string) || '已入队')
     await refreshQueue()
   } catch (e) {
+    // 预算护栏：弹审批框而不是干巴巴报错；批准 = 放行一次并重试
+    if (!retried && (await requestBudgetApproval(e, state.project, 'gacha')) === 'approved') {
+      busy.value = false
+      await enqueue(true)
+      return
+    }
     ElMessage.error(`入队失败：${(e as Error).message}`)
   } finally {
     busy.value = false
@@ -107,8 +121,8 @@ async function upload(filename: string, b64: string) {
 .acbtn:disabled { opacity: .5; cursor: not-allowed; }
 .acnone { line-height: 1.5; }
 .acgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 6px; }
-.accand { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; cursor: pointer; background: #fbfbfc; }
-.accand:hover { border-color: #c5d4a4; }
+.accand { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; cursor: pointer; background: var(--surface-2); }
+.accand:hover { border-color: var(--hover-border); }
 .accand.adopted { border-color: var(--lime); box-shadow: 0 0 0 2px color-mix(in srgb, var(--lime) 35%, transparent); }
 .accand img { width: 100%; aspect-ratio: 16/9; object-fit: cover; display: block; }
 .accap { display: flex; align-items: center; gap: 4px; padding: 2px 5px; font-size: 10px; color: var(--muted); }

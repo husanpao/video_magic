@@ -127,11 +127,5 @@ function rowTitle(s: ShotRow): string {
 .navrow .sid { font-variant-numeric: tabular-nums; font-weight: 600; }
 .navrow .sec { margin-left: auto; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
 
-/* theme.css 的 .tone-* 只给了文字色，状态点要的是底色（旧文件 .dot.tone-*） */
-.dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; background: #c7ccd4; }
-.dot.tone-ok { background: var(--ok); }
-.dot.tone-warn { background: var(--warn); }
-.dot.tone-bad { background: var(--bad); }
-.dot.tone-run { background: var(--run); }
-.dot.tone-idle { background: #c7ccd4; }
+/* .dot.tone-* 状态点样式已收编进 theme.css（U13 去重），此处不再各抄一份。 */
 </style>

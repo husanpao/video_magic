@@ -130,21 +130,41 @@ def _has_filter(name: str) -> bool:
     return any(line.split()[1] == name for line in (p.stdout or "").splitlines() if len(line.split()) > 2)
 
 
-def detect_cjk_font() -> str:
+def _subtitle_settings(proj=None) -> dict:
+    """T3 配置中心：字幕字体与样式（subtitle_* 键）的生效设置。
+
+    任何异常都回**空 dict** —— 空 dict 走旧硬编码默认（逐字节一致），
+    配置子系统出一点问题都不能让合成跑不起来。
+    """
+    try:
+        try:
+            from . import config as _cfg
+        except ImportError:  # 直接脚本运行时
+            import config as _cfg  # type: ignore
+        return _cfg.subtitle_settings(proj.root if proj is not None else None) or {}
+    except Exception:  # noqa: BLE001 —— 见上：这里必须静默回默认
+        return {}
+
+
+def detect_cjk_font(candidates: list[str] | None = None,
+                    hints: list | None = None) -> str:
     """探测可用的中文字体族名；找不到就抛错并给安装提示。
 
     注意 fc-match 的坑：**它永远会返回一个字体**（找不到就给默认字体 DejaVu 之类），
     所以不能只看 returncode，必须检查返回的族名里真的包含请求的名字；
     否则字体会静默退化成无中文字形 → 满屏方块。
+
+    （T3：候选顺序 / 兜底文件路径已开放为配置 subtitle_font_candidates /
+    subtitle_font_file_hints；不传 = 用下方常量，行为与从前逐字节一致。）
     """
     fc = shutil.which("fc-match")
     if fc:
-        for fam in FONT_CANDIDATES:
+        for fam in (candidates or FONT_CANDIDATES):
             p = subprocess.run([fc, "-f", "%{family}", fam], capture_output=True, text=True)
             got = (p.stdout or "").strip()
             if p.returncode == 0 and got and fam.lower() in got.lower():
                 return fam
-    for path, fam in FONT_FILE_HINTS:
+    for path, fam in (hints or FONT_FILE_HINTS):
         if Path(path).exists():
             return fam
     raise RuntimeError(
@@ -156,23 +176,34 @@ def detect_cjk_font() -> str:
     )
 
 
-def _resolve_font() -> str:
-    forced = os.environ.get("VM_SUBTITLE_FONT", "").strip()
-    return forced or detect_cjk_font()
+def _resolve_font(sub: dict | None = None) -> str:
+    sub = sub or {}
+    forced = str(sub.get("font") or os.environ.get("VM_SUBTITLE_FONT", "") or "").strip()
+    return forced or detect_cjk_font(sub.get("candidates"), sub.get("file_hints"))
 
 
-def _subtitle_style(font: str, height: int) -> str:
+def _subtitle_style(font: str, height: int, sub: dict | None = None) -> str:
     """字幕样式：白字 + 黑描边 + 底部居中。
 
     FontSize 按画面高度自适应：libass 处理 SRT 时的基准分辨率是视频自身，
     所以同一套字号在 864×480 和 320×240 上观感一致。
+
+    （T3：字号/颜色/描边/边距开放为配置 subtitle_font_size / subtitle_primary_color /
+    subtitle_outline_color / subtitle_outline / subtitle_margin_v；0 或空 = 原自适应口径，
+    不改配置时输出字符串逐字节一致。）
     """
-    fs = max(12, round(height / 22))
-    mv = max(8, round(height / 18))
+    sub = sub or {}
+    fs = int(sub.get("font_size") or 0) or max(12, round(height / 22))
+    mv = int(sub.get("margin_v") or 0) or max(8, round(height / 18))
+    primary = str(sub.get("primary_color") or "&H00FFFFFF")
+    outline_c = str(sub.get("outline_color") or "&H00000000")
+    ol = sub.get("outline")
+    # 整数值照旧输出 "2" 而不是 "2.0" —— 保证不改配置时字符串逐字节不变
+    ol_s = "2" if ol is None else (str(int(ol)) if float(ol).is_integer() else str(ol))
     return (
         f"FontName={font},FontSize={fs},"
-        "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
-        "BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=" + str(mv)
+        f"PrimaryColour={primary},OutlineColour={outline_c},"
+        f"BorderStyle=1,Outline={ol_s},Shadow=0,Alignment=2,MarginV=" + str(mv)
     )
 
 
@@ -503,7 +534,7 @@ def _concat_copy(clips: list[Path], dst: Path, tmpdir: Path) -> bool:
 
 def _finalize(
     src: Path, out: Path, *, srt: Path | None, font: str, height: int,
-    width: int, fps: int, tmpdir: Path,
+    width: int, fps: int, tmpdir: Path, sub: dict | None = None,
 ) -> None:
     """一次编码把 intermediate 落成最终规格（顺带烧字幕）。"""
     # 本函数用 cwd=tmpdir 跑 ffmpeg（为了 sub.srt 的相对名，躲开 filtergraph 转义），
@@ -518,7 +549,7 @@ def _finalize(
     if srt is not None:
         # srt 复制成纯 ASCII 相对名 + cwd=临时目录：彻底躲开 filtergraph 路径转义
         shutil.copyfile(srt, tmpdir / "sub.srt")
-        vf = f"subtitles=sub.srt:force_style='{_subtitle_style(font, height)}'"
+        vf = f"subtitles=sub.srt:force_style='{_subtitle_style(font, height, sub)}'"
     if vf:
         cmd += ["-vf", vf]
     cmd += ["-map", "0:v:0", "-map", "0:a:0" if has_audio else "1:a:0"]
@@ -536,6 +567,7 @@ def _finalize(
 def _build_filter_graph(
     clips: list[Path], probes: list[dict], *, width: int, height: int, fps: int,
     transition: str, srt_name: str | None, font: str, trims: list[float] | None = None,
+    sub: dict | None = None,
 ) -> tuple[list[str], str, str, str]:
     """构造单趟 filter_complex 的输入参数与滤镜图。
 
@@ -603,7 +635,7 @@ def _build_filter_graph(
 
     vout = vcat
     if srt_name:
-        chains.append(f"[{vcat}]subtitles={srt_name}:force_style='{_subtitle_style(font, height)}'[vsub]")
+        chains.append(f"[{vcat}]subtitles={srt_name}:force_style='{_subtitle_style(font, height, sub)}'[vsub]")
         vout = "vsub"
     return args, ";".join(chains), vout, acat
 
@@ -611,6 +643,7 @@ def _build_filter_graph(
 def _encode_filtered(
     clips: list[Path], probes: list[dict], out: Path, *, width: int, height: int, fps: int,
     transition: str, srt: Path | None, font: str, tmpdir: Path, trims: list[float] | None = None,
+    sub: dict | None = None,
 ) -> None:
     """单趟 filter_complex 编码落成片（转场 / 参数不一致时 / 有起始裁剪时的 fallback）。"""
     # 同 _finalize：cwd=tmpdir 跑 ffmpeg，路径必须绝对化
@@ -622,7 +655,7 @@ def _encode_filtered(
         srt_name = "sub.srt"
     args, graph, vout, aout = _build_filter_graph(
         clips, probes, width=width, height=height, fps=fps,
-        transition=transition, srt_name=srt_name, font=font, trims=trims,
+        transition=transition, srt_name=srt_name, font=font, trims=trims, sub=sub,
     )
     cmd = [_which(FFMPEG), "-y", "-v", "error", "-nostdin"] + args + [
         "-filter_complex", graph,
@@ -844,8 +877,9 @@ def assemble(
 
     # 字幕：.srt 总是导出；是否烧录由 burn_subtitle 决定
     font = ""
+    sub = _subtitle_settings(proj)   # T3：字幕字体与样式配置（空 = 旧硬编码默认）
     if burn_subtitle:
-        font = _resolve_font()
+        font = _resolve_font(sub)
         if not _has_filter("subtitles"):
             raise RuntimeError(
                 "ffmpeg 没有 subtitles 滤镜（缺 libass），无法烧录字幕。\n"
@@ -887,13 +921,14 @@ def assemble(
                 log("[asm] concat 流复制成功（参数一致），单次编码落规格")
                 _finalize(
                     joined, tmp_out, srt=tmp_srt if burn else None, font=font,
-                    height=height, width=width, fps=fps, tmpdir=tmpdir,
+                    height=height, width=width, fps=fps, tmpdir=tmpdir, sub=sub,
                 )
             else:
                 log("[asm] 参数不一致，改用 filter_complex 重编码拼接")
                 _encode_filtered(
                     clips, probes, tmp_out, width=width, height=height, fps=fps,
                     transition="cut", srt=tmp_srt if burn else None, font=font, tmpdir=tmpdir,
+                    sub=sub,
                 )
         else:
             if trimmed_n:
@@ -901,7 +936,7 @@ def assemble(
             _encode_filtered(
                 clips, probes, tmp_out, width=width, height=height, fps=fps,
                 transition=transition, srt=tmp_srt if burn else None, font=font,
-                tmpdir=tmpdir, trims=trims,
+                tmpdir=tmpdir, trims=trims, sub=sub,
             )
         os.replace(tmp_out, out)      # 成片先原子生效
         os.replace(tmp_srt, srt_path)  # 字幕紧随其后，两者始终成对

@@ -267,7 +267,8 @@ class Checkpoint:
     """
 
     path: Path
-    shots: dict[str, str] = field(default_factory=dict)
+    # 值是 {"pid":…,"at":…}（新格式）或 str（旧格式），get()/age() 双格式兼容
+    shots: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: Path) -> "Checkpoint":
@@ -278,7 +279,12 @@ class Checkpoint:
                 d = json.load(f)
         except (json.JSONDecodeError, OSError):
             return cls(path=path)
-        return cls(path=path, shots={str(k): str(v) for k, v in (d.get("shots") or {}).items()})
+        # ★ 只 str(k)，**值原样保留**（BUG-1）：值是 {"pid":…,"at":…} 字典或旧格式
+        #   字符串，`str(v)` 会把字典转成 "{'at': …, 'pid': …}" 字符串 ——
+        #   get() 回读的 prompt_id 是字典字符串（/history 回收必查不到 → 重复提交
+        #   白烧 GPU），age() 因值不再是 dict 恒 inf（A6 宽限期失效）。
+        #   get()/age() 本来就有 dict/字符串双格式兼容分支，喂原样值即可对齐。
+        return cls(path=path, shots={str(k): v for k, v in (d.get("shots") or {}).items()})
 
     def save(self) -> None:
         _atomic_write_json(self.path, {"shots": dict(self.shots)})

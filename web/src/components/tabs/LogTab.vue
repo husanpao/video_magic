@@ -61,7 +61,7 @@ function clear() {
   font: 11.5px/1.55 ui-monospace, Menlo, Consolas, monospace;
   white-space: pre-wrap;
   word-break: break-all;
-  color: #333a45;
-  background: #fcfdfe;
+  color: var(--text-2);
+  background: var(--surface-2);
 }
 </style>

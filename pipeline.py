@@ -34,6 +34,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from vm import taskctl  # noqa: E402
+from vm import config as vm_config  # noqa: E402  配置中心（T3）：两层配置 + env 注入
 from vm.state import Project  # noqa: E402
 
 STAGES = taskctl.STAGES
@@ -368,7 +369,10 @@ def worker_main(args) -> int:
     import signal as _signal
 
     proj = Project(taskctl.resolve_project(args.project)).ensure()
-    params = taskctl.load_params(proj.root)
+    # T3 配置中心：全局层物化进 taskctl.DEFAULT_PARAMS + env 注入（QI_*/帧网格/字幕），
+    # 再走 load_params 叠项目层 —— 返回值形状与 load_params 完全一致。
+    # 在 worker 入口装：渲染/指纹用的是这份 params，web 端的指纹也走同一合并口径，两边不会打架。
+    params = vm_config.install(proj.root)
     stop_flag = threading.Event()
     finished = threading.Event()
     forced = {"rc": 143}
@@ -531,6 +535,9 @@ def cmd_serve(project: str | None, port: int) -> int:
     from vm import web
 
     root = taskctl.PROJECTS_DIR
+    # T3 配置中心：web 进程也要装全局层 —— shot_table 算镜头指纹用的参数
+    # 必须与 worker 一致，否则改了全局渲染参数后界面会"刚渲完就显示需重渲"。
+    vm_config.install(None, root)
     if project:
         pdir = taskctl.resolve_project(project)
         if not pdir.is_dir():

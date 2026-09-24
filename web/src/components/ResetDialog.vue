@@ -68,7 +68,7 @@ import { computed, ref } from 'vue'
 import { ElButton, ElDialog, ElInput, ElMessage, ElOption, ElSelect } from 'element-plus'
 import { api } from '@/api/client'
 import type { ResetPreview } from '@/api/types'
-import { loadProjects, refreshStatus, state } from '@/stores/app'
+import { clearTransient, loadProjects, refreshAll, refreshStatus, state } from '@/stores/app'
 
 const open = defineModel<boolean>({ required: true })
 const scope = ref<'clips' | 'shots' | 'all'>('shots')
@@ -102,10 +102,13 @@ async function doReset() {
     const r = await api.reset(state.project, scope.value, typed.value)
     ElMessage.success(String(r.message || '已清空'))
     open.value = false
-    // 全项目级状态都要重拉 —— 清空后旧数据一条都不能留（否则界面显示已删的镜头）
+    // 全项目级状态都要重拉 —— 清空后旧数据一条都不能留（否则界面显示已删的镜头）。
+    // ★ 不再整页 window.location.reload()（写后即刷 / 反馈缺口）：就地把所有数据刷回来，
+    //   页面不闪、轮询不重置；多选/撤销栈/乐观标记指向已删数据，一并清掉（clearTransient）。
+    clearTransient()
     await loadProjects()
-    await refreshStatus(true)
-    window.location.reload()
+    await refreshStatus()
+    await refreshAll()
   } catch (e) {
     ElMessage.error(`清空失败：${(e as Error).message}`)
   } finally {
@@ -122,8 +125,8 @@ defineExpose({ load })
 .rdsec { display: flex; flex-direction: column; gap: 3px; }
 .rdsec b { font-size: 12.5px; }
 .rdline { display: flex; align-items: center; gap: 6px; font-size: 11.5px; padding: 2px 5px; border-radius: 5px; }
-.rdline.del { background: #fdeceb; }
-.rdline.keep { background: #eef7ea; }
+.rdline.del { background: var(--bad-bg); }
+.rdline.keep { background: var(--ok-bg); }
 .rdtotal { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
 .rdwarn { font-size: 11px; color: var(--bad); margin-top: 3px; }
 </style>

@@ -82,9 +82,10 @@
 
 <script setup lang="ts">
 import { computed, onUnmounted, ref } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage } from 'element-plus'
 import { api } from '@/api/client'
 import { refreshQueue, state } from '@/stores/app'
+import { confirmAction } from '@/composables/confirmAction'
 
 const expanded = ref(false)
 const now = ref(Date.now())
@@ -150,9 +151,14 @@ async function clear() {
 }
 
 async function onStop() {
-  try {
-    await ElMessageBox.confirm('停止当前任务？已渲染完的片段会保留（有断点续渲）。', '停止任务', { type: 'warning' })
-  } catch { return }
+  // 统一确认（U10）：打断任务是破坏性动作，确认框说清"已渲染完的会保留"
+  const ok = await confirmAction({
+    title: '停止任务',
+    message: '停止当前任务？已渲染完的片段会保留（有断点续渲）。',
+    confirmText: '停止',
+    danger: true,
+  })
+  if (!ok) return
   try {
     const r = await api.stop(state.project)
     ElMessage.success((r.message as string) || '已停止')
@@ -175,10 +181,10 @@ async function onStop() {
 .fab.busy .fabbtn { border-color: color-mix(in srgb, var(--lime) 60%, var(--ink)); }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--run); }
 .fab.busy .dot { background: var(--lime); animation: pulse 1.4s ease-in-out infinite; }
-.dot.idle { background: #c2c8d0; animation: none; }
+.dot.idle { background: var(--dot-idle); animation: none; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
 .badge {
-  background: var(--bad); color: #fff; border-radius: 9px; padding: 0 6px; font-size: 10.5px;
+  background: var(--bad); color: var(--card); border-radius: 9px; padding: 0 6px; font-size: 10.5px;
   font-weight: 700; min-width: 16px; text-align: center;
 }
 .panel {
@@ -192,21 +198,21 @@ async function onStop() {
 .phead .x { border: 0; background: transparent; cursor: pointer; font: inherit; color: var(--muted); }
 .prow { display: flex; align-items: center; gap: 6px; }
 /* 不确定态：左右滑动的条，不假装知道进度 */
-.indet { height: 8px; border-radius: 4px; background: #eef0f3; overflow: hidden; position: relative; }
+.indet { height: 8px; border-radius: 4px; background: var(--surface-3); overflow: hidden; position: relative; }
 .indet i {
   position: absolute; inset: 0; width: 40%; border-radius: 4px; background: var(--lime);
   animation: indet 1.3s ease-in-out infinite;
 }
 @keyframes indet { 0% { left: -40%; } 100% { left: 100%; } }
 .lastlog {
-  font-size: 10.5px; color: #374151; background: #f4f6f2; border-radius: 6px;
+  font-size: 10.5px; color: var(--text-3); background: var(--surface-2); border-radius: 6px;
   padding: 3px 6px; line-height: 1.45; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .jobs { display: flex; flex-direction: column; gap: 2px; max-height: 220px; overflow: auto; }
 .job { display: flex; align-items: center; gap: 5px; font-size: 11px; padding: 2px 3px; border-radius: 5px; }
-.job.running { background: #eef6ff; }
+.job.running { background: var(--run-bg); }
 .job.done { color: var(--muted); }
-.job.failed { background: #fdeceb; color: var(--bad); }
+.job.failed { background: var(--bad-bg); color: var(--bad); }
 .job.canceled { color: var(--muted); text-decoration: line-through; }
 .jsym { width: 12px; text-align: center; }
 .jlabel { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 152px; }

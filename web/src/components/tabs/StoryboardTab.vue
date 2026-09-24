@@ -104,19 +104,19 @@ onMounted(load)
 .model code { font-size: 10.5px; }
 .lim { font-size: 11.5px; line-height: 1.6; }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 8px; }
-.cell { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: #fbfbfc; }
+.cell { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--surface-2); }
 .cell.missing { opacity: .62; }
 .cell img { width: 100%; aspect-ratio: 16/9; object-fit: cover; display: block; }
 .cell .ph {
   width: 100%; aspect-ratio: 16/9; display: flex; align-items: center; justify-content: center;
-  background: #eef0f3; color: var(--muted); font-size: 11px;
+  background: var(--surface-3); color: var(--muted); font-size: 11px;
 }
 .cap { display: flex; align-items: center; gap: 4px; padding: 3px 5px; font-size: 10.5px; }
 .cap .sid { font-variant-numeric: tabular-nums; }
 .tag { font-size: 9.5px; padding: 0 4px; border-radius: 4px; }
-.tag.ok { background: #e6f2d0; color: var(--ok); }
-.tag.warn { background: #fdf3df; color: var(--warn); }
-.tag.bad { background: #fdeceb; color: var(--bad); }
-.tag.idle { background: #eef0f3; color: var(--muted); }
+.tag.ok { background: var(--ok-bg); color: var(--ok); }
+.tag.warn { background: var(--warn-bg); color: var(--warn); }
+.tag.bad { background: var(--bad-bg); color: var(--bad); }
+.tag.idle { background: var(--surface-3); color: var(--muted); }
 .cell > .small { padding: 0 5px 4px; }
 </style>
