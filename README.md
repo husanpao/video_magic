@@ -145,16 +145,18 @@ ffmpeg、Python 3.10+、Node 18+、DeepSeek API key
 
 | 依赖 | 版本 |
 |---|---|
-| ComfyUI | 0.3.x |
+| ComfyUI | **≥ 0.37.0**（Qwen-Image 2.1 支持；本机实测 v0.37.4） |
 | Python | 3.10+（**零第三方依赖**，纯标准库） |
 | Node.js | 18+（只用于构建前端） |
 | ffmpeg / ffprobe | 任意较新版 |
 
 ```
-models/diffusion_models/  MiniMax-H3 相关权重          # 视频
-models/diffusion_models/  qwen_image_nvfp4.safetensors # 定妆/场景/道具/分镜图
-models/text_encoders/     qwen_2.5_vl_7b_nvfp4.safetensors
-models/vae/               qwen_image_vae.safetensors
+models/diffusion_models/  MiniMax-H3 相关权重                        # 视频
+# 定妆/场景/道具/分镜图（Qwen-Image 2.1，默认代次；可在「⚙ 设置 → 模型」切回 2.0）
+models/diffusion_models/  qwen_image_2.1_int8_convrot.safetensors
+models/text_encoders/     qwen3vl_8b_int8_convrot.safetensors
+models/vae/               qwen_image_2.1_vae_bf16.safetensors
+# 切回 2.0 时对应的三件套：qwen_image_nvfp4 / qwen_2.5_vl_7b_nvfp4 / qwen_image_vae
 ```
 
 </details>

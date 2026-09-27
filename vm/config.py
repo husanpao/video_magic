@@ -256,25 +256,39 @@ SCHEMA: tuple[Item, ...] = (
         render_only=True,
     ),
     _it(
-        "qi_unet", "模型", "分镜图模型（Qwen-Image）", "str", "qwen_image_nvfp4.safetensors",
-        what="定妆照 / 场景道具概念图 / 分镜图用的文生图模型。",
-        effect="Qwen-Image 2.1 本机 ComfyUI 0.36 加载不了（实测报 Could not detect model type），2.0 nvfp4 可跑。",
+        "qi_gen", "模型", "分镜图模型代次（Qwen-Image）", "enum", "2.1",
+        what="定妆照 / 场景道具概念图 / 分镜图用哪一代 Qwen-Image："
+             "2.1（默认；官方 2026-09 发布：原生 2K、RGBA 透明、最多 10 张参考图，"
+             "需 ComfyUI ≥ 0.37.0）或 2.0（老路径，ComfyUI 0.36 起就能跑）。",
+        effect="切换代次会自动换掉下面三个模型文件（留空即跟随）；2.1 官方口径是 cfg=1、25 步起，"
+               "与 2.0（cfg 2.5、20 步、吃负向词）不同，出图风格会变。"
+               "本机实测 2.1：1024×576 / 25 步约 10 秒一张。",
+        stale="不进镜头指纹，但已有分镜图/定妆照是按旧代出的 —— 换代后建议重出定妆照与分镜图。",
+        channel="env", env="VM_QI_GEN", enum=("2.1", "2.0"),
+    ),
+    _it(
+        "qi_unet", "模型", "分镜图模型", "str", "",
+        what="定妆照 / 场景道具概念图 / 分镜图用的文生图模型（models/diffusion_models/）。"
+             "**留空 = 跟随上面的「代次」自动选**。",
+        effect="2.0 → qwen_image_nvfp4.safetensors；2.1 → qwen_image_2.1_int8_convrot.safetensors（6.8GB）。",
         stale="不进镜头指纹（分镜图不参与渲染指纹）；对之后的出图生效。",
-        channel="env", env="QI_UNET",
+        channel="env", env="QI_UNET", nullable=True, placeholder="留空 = 跟随代次自动选择",
     ),
     _it(
-        "qi_clip", "模型", "分镜图文本编码器", "str", "qwen_2.5_vl_7b_nvfp4.safetensors",
-        what="Qwen-Image 配套的文本编码器（models/text_encoders/ 下）。",
-        effect="模型配套件，换 Qwen-Image 版本时一起换。",
+        "qi_clip", "模型", "分镜图文本编码器", "str", "",
+        what="Qwen-Image 配套的文本编码器（models/text_encoders/ 下）。"
+             "**留空 = 跟随代次**。",
+        effect="2.0 → qwen_2.5_vl_7b_nvfp4.safetensors；2.1 → qwen3vl_8b_int8_convrot.safetensors。"
+               "⚠️ 2.1 还有另一个 qwen3.5_9b_..._pe_t2i 是「提示词增强器」，不在本路径上、不是它。",
         stale="不进镜头指纹；对之后的出图生效。",
-        channel="env", env="QI_CLIP",
+        channel="env", env="QI_CLIP", nullable=True, placeholder="留空 = 跟随代次自动选择",
     ),
     _it(
-        "qi_vae", "模型", "分镜图 VAE", "str", "qwen_image_vae.safetensors",
-        what="Qwen-Image 配套的 VAE（models/vae/ 下）。",
-        effect="模型配套件。",
+        "qi_vae", "模型", "分镜图 VAE", "str", "",
+        what="Qwen-Image 配套的 VAE（models/vae/ 下）。**留空 = 跟随代次**。",
+        effect="2.0 → qwen_image_vae.safetensors；2.1 → qwen_image_2.1_vae_bf16.safetensors。",
         stale="不进镜头指纹；对之后的出图生效。",
-        channel="env", env="QI_VAE",
+        channel="env", env="QI_VAE", nullable=True, placeholder="留空 = 跟随代次自动选择",
     ),
     _it(
         "models_root", "模型", "ComfyUI models 目录", "path", "/home/max/ComfyUI/models",
@@ -833,22 +847,28 @@ def preflight(flat: dict[str, Any], *, root: Path | None = None) -> list[dict]:
 
     # 2) 模型文件存在性（只读）：按 ComfyUI 的目录约定逐一对照
     root_models = Path(str(v.get("models_root") or "/home/max/ComfyUI/models"))
+    # 分镜图三项留空 = 跟随「代次」，所以这里先按代解析出真实文件名再查（否则会误报缺失）
+    try:
+        from vm.qi import GEN_MODELS as _QI_GEN_MODELS
+    except Exception:  # noqa: BLE001 —— 预检不能因为 import 失败就炸
+        _QI_GEN_MODELS = {}
+    _qi_models = _QI_GEN_MODELS.get(str(v.get("qi_gen") or "2.0"), {})
     want = [
-        ("视频主模型 unet", "unet", "diffusion_models"),
-        ("渲染 LoRA", "lora", "loras"),
-        ("视频 VAE", "vae_video", "vae"),
-        ("音频 VAE", "vae_audio", "vae"),
-        ("视频文本编码器", "clip", "text_encoders"),
-        ("分镜图模型", "qi_unet", "diffusion_models"),
-        ("分镜图文本编码器", "qi_clip", "text_encoders"),
-        ("分镜图 VAE", "qi_vae", "vae"),
+        ("视频主模型 unet", str(v.get("unet") or ""), "diffusion_models"),
+        ("渲染 LoRA", str(v.get("lora") or ""), "loras"),
+        ("视频 VAE", str(v.get("vae_video") or ""), "vae"),
+        ("音频 VAE", str(v.get("vae_audio") or ""), "vae"),
+        ("视频文本编码器", str(v.get("clip") or ""), "text_encoders"),
+        ("分镜图模型", str(v.get("qi_unet") or _qi_models.get("unet") or ""), "diffusion_models"),
+        ("分镜图文本编码器", str(v.get("qi_clip") or _qi_models.get("clip") or ""), "text_encoders"),
+        ("分镜图 VAE", str(v.get("qi_vae") or _qi_models.get("vae") or ""), "vae"),
     ]
     missing = []
-    for label, key, sub in want:
-        name = str(v.get(key) or "")
+    for label, name, sub in want:
         p = root_models / sub / name
         if not name or not p.is_file():
-            missing.append(f"{label}（应放在 {root_models / sub}/{name}）")
+            extra = "（分镜图项留空会自动跟随「代次」，请检查上面选了哪一代）" if label.startswith("分镜图") and not name else ""
+            missing.append(f"{label}（应放在 {root_models / sub}/{name}）{extra}")
     checks.append({
         "id": "models", "label": "模型文件", "ok": not missing,
         "detail": "8 个模型文件都在" if not missing else f"缺 {len(missing)} 个：" + "；".join(missing),

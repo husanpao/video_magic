@@ -159,8 +159,10 @@ def t_prompt() -> None:
 
 
 def t_workflow() -> None:
-    print("[4] 工作流拼装")
-    cfg = QIConfig()
+    print("[4] 工作流拼装（2.0 图，显式指定代次）")
+    # ★ 显式 gen="2.0"：默认代次会随升级变化（2026-09-26 起默认 2.1），
+    #   这一节锁的是「2.0 那张图的写法」，所以必须写死代次，否则默认一变就假失败。
+    cfg = QIConfig(gen="2.0")
     qi = QwenImage(cfg)
     g = qi.build("a cat", seed=7, filename_prefix="VM_SB_x")
     types = {k: v["class_type"] for k, v in g.items()}
@@ -186,17 +188,17 @@ def t_workflow() -> None:
     check("seed 透传", ks["seed"] == 7)
     check("默认不挂 ModelSamplingAuraFlow", "4" not in g)
 
-    cfg2 = QIConfig(aura_shift=3.1)
+    cfg2 = QIConfig(gen="2.0", aura_shift=3.1)
     g2 = QwenImage(cfg2).build("a cat", seed=1)
     check("aura_shift 开启时挂节点 4", g2.get("4", {}).get("class_type") == "ModelSamplingAuraFlow")
     check("aura_shift 时 KSampler 改接节点 4", g2["8"]["inputs"]["model"] == ["4", 0])
 
     notes: list[str] = []
-    g3 = QwenImage(QIConfig()).build("a cat", width=1000, height=570, extra_note=notes.append)
+    g3 = QwenImage(QIConfig(gen="2.0")).build("a cat", width=1000, height=570, extra_note=notes.append)
     check("非法尺寸吸附有回调说明", bool(notes) and (g3["7"]["inputs"]["width"], g3["7"]["inputs"]["height"]) == (992, 560))
 
     try:
-        QwenImage(QIConfig()).build("   ")
+        QwenImage(QIConfig(gen="2.0")).build("   ")
         check("空提示词拒绝提交", False, "居然没抛")
     except Exception as e:  # ComfyError
         check("空提示词拒绝提交", "空" in str(e))
@@ -255,15 +257,73 @@ def _tiny_png(w: int, h: int) -> bytes:
 # ── 6. 联网探测（只读）─────────────────────────────────────────────────────
 
 
+# ── 4b. 两代工作流（2.0 / 2.1）─────────────────────────────────────────────
+
+
+def t_workflow_gens() -> None:
+    """2.1 的工作流必须与上游官方模板一致（节点/连线/口径），且换代要能反映到指纹上。
+
+    这些正是"不改文件看不出来"的东西：latent 节点选错（4 通道 vs 16 通道）、
+    conditioning 接错输出槽、换代没进指纹 —— 三种错都会静默出坏图或静默不重出图。
+    """
+    print("[4b] 两代工作流（2.0 / 2.1）")
+
+    c20 = QIConfig(gen="2.0")
+    g20 = QwenImage(c20).build("a cat", seed=1)
+    check("2.0 用 EmptySD3LatentImage（16 通道）", g20["7"]["class_type"] == "EmptySD3LatentImage")
+    check("2.0 正/负各一个 CLIPTextEncode",
+          g20["5"]["class_type"] == "CLIPTextEncode" and g20["6"]["class_type"] == "CLIPTextEncode",
+          f"{g20['5']['class_type']} / {g20['6']['class_type']}")
+    check("2.0 官方口径 20 步 / cfg 2.5", (c20.steps, c20.cfg) == (20, 2.5), f"{c20.steps}/{c20.cfg}")
+
+    c21 = QIConfig(gen="2.1")
+    g21 = QwenImage(c21).build("a cat", seed=1)
+    kinds = [g21[k]["class_type"] for k in sorted(g21, key=int)]
+    check("2.1 文本编码用 TextEncodeQwenImage21", "TextEncodeQwenImage21" in kinds, str(kinds))
+    check("2.1 latent 用 EmptyLatentImage（4 通道，照官方模板）",
+          g21["7"]["class_type"] == "EmptyLatentImage", g21["7"]["class_type"])
+    check("2.1 带 QwenImage21Cache 且 KSampler 接它",
+          g21["11"]["class_type"] == "QwenImage21Cache" and g21["8"]["inputs"]["model"] == ["11", 0],
+          f"{g21['11']['class_type']} model={g21['8']['inputs']['model']}")
+    check("2.1 正/负 conditioning 取自同节点两个输出槽",
+          g21["8"]["inputs"]["positive"] == ["5", 0] and g21["8"]["inputs"]["negative"] == ["5", 1])
+    check("2.1 官方口径 25 步 / cfg 1.0", (c21.steps, c21.cfg) == (25, 1.0), f"{c21.steps}/{c21.cfg}")
+    check("2.1 模型名自动跟随代次",
+          c21.unet_name == "qwen_image_2.1_int8_convrot.safetensors"
+          and c21.clip_name == "qwen3vl_8b_int8_convrot.safetensors"
+          and c21.vae_name == "qwen_image_2.1_vae_bf16.safetensors",
+          f"{c21.unet_name} / {c21.clip_name} / {c21.vae_name}")
+    check("显式模型名优先于代次默认",
+          QIConfig(gen="2.1", unet_name="x.safetensors").unet_name == "x.safetensors")
+    check("默认代次已是 2.1（2026-09-26 升级后的口径）", QIConfig().gen == "2.1",
+          QIConfig().gen)
+    check("换代进指纹（否则切了代、图还判 current）",
+          QIConfig(gen="2.0").render_dict() != QIConfig(gen="2.1").render_dict())
+    ok_err = False
+    try:
+        QIConfig(gen="9.9")
+    except ValueError:
+        ok_err = True
+    check("非法代次直接报错（不静默兜底）", ok_err)
+
+
 def t_live() -> None:
-    print("[6] --live：ComfyUI 探测（只读，不提交任务）")
-    p = QwenImage(QIConfig()).probe()
+    print("[6] --live：ComfyUI 探测 · 2.0 老路径（只读，不提交任务）")
+    p = QwenImage(QIConfig(gen="2.0")).probe()
     print(p.report())
     check("ComfyUI 在线", p.healthy)
     check("必需节点齐全（缺节点必须靠更新 ComfyUI 解决，不降级）", not p.nodes_missing,
           ", ".join(p.nodes_missing))
     if p.models_missing:
         print("  ℹ 模型尚未就绪（下载中/未放置）：" + ", ".join(p.models_missing))
+
+    # 2.1 需要 ComfyUI >= 0.37.0（TextEncodeQwenImage21）；升级前这里会红，属预期。
+    print("[6b] --live：2.1 节点可用性（需 ComfyUI >= 0.37.0）")
+    p21 = QwenImage(QIConfig(gen="2.1")).probe()
+    check("2.1 必需节点齐全（含 TextEncodeQwenImage21）", not p21.nodes_missing,
+          ", ".join(p21.nodes_missing))
+    if p21.models_missing:
+        print("  ℹ 2.1 模型尚未就绪：" + ", ".join(p21.models_missing))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -273,6 +333,7 @@ def main(argv: list[str] | None = None) -> int:
     t_fp()
     t_prompt()
     t_workflow()
+    t_workflow_gens()
     t_index()
     if "--live" in argv:
         t_live()
