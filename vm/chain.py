@@ -30,6 +30,7 @@ chain.py —— 连贯链式渲染（社区成熟工作流 MiniMaxH3-TimelineDir
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -80,6 +81,22 @@ def _ref_paths(proj: Any, shot: Any) -> list[Path]:
     return [p for p, _src in _refs(proj, shot)]
 
 
+_FENCE_RE = re.compile(r"(?m)^\s*```[A-Za-z0-9_+-]*\s*$")
+
+
+def _clean_prompt(prompt: str) -> str:
+    """
+    去掉提示词里的 Markdown 代码围栏。
+
+    为什么：官方预置工作流（达尔文MV·8 段）第 2–8 段的 prompt 里混进了 ` ```text `——
+    生成提示词的 agent 把 markdown 一起写进去了。围栏会被 H3 当正文读，白占 token，
+    还可能干扰六段式结构。自己出表时也可能被 LLM 带进来，所以这里防御性清洗。
+    """
+    if not prompt:
+        return prompt or ""
+    return "\n".join(ln for ln in prompt.splitlines() if not _FENCE_RE.match(ln)).strip()
+
+
 def plan_chains(
     shots: list[Any],
     *,
@@ -91,10 +108,15 @@ def plan_chains(
     把镜头编成链。成链条件（全部满足才连）：
       · 相邻（表中相邻）
       · 同一个 `scene_id`（同一个地点）
-      · **chars 完全相同且顺序相同** —— 链只有一份参考图清单，而 `<Picture N>` 的编号
-        是全局的；不同角色集合会让编号错位（画面正常但人不对，最难查）。所以宁可断开。
       · 都没有被锁定（锁定 = 用户已认可的那一版，不能被链重渲覆盖）
       · 每链 ≤ max_shots 镜
+
+    ★ 不再要求 chars 相同（2026-09-28 修正）：官方预置工作流证明
+    `segmentConfig.segments[].images/audios` 是**按段独立**的，且 `<Picture N>`/`<Audio N>`
+    编号**每段从 1 重新开始**（源码 `_ordered_segment_assets` + `_timeline_for_prompt_index`）。
+    所以同场景里换角色的镜头也能成链，各段引用各自的参考图即可 —— 而我们的逐镜提示词
+    本来就是按"本镜第一个角色 = <Picture 1>"写的，正好对上。
+
     返回只含**长度 ≥ 2** 的链；长度 1 的交回单镜路径。
     """
     is_locked = is_locked or (lambda _sid: False)
@@ -106,9 +128,8 @@ def plan_chains(
             and len(cur) < max_shots
             and not is_locked(getattr(s, "id", ""))
             and not is_locked(getattr(cur[-1], "id", ""))
-            and getattr(s, "scene_id", "") == getattr(cur[-1], "scene_id", "")
-            and list(getattr(s, "chars", []) or []) == list(getattr(cur[-1], "chars", []) or [])
             and bool(getattr(s, "scene_id", ""))
+            and getattr(s, "scene_id", "") == getattr(cur[-1], "scene_id", "")
         )
         if joinable:
             cur.append(s)
@@ -119,7 +140,9 @@ def plan_chains(
     if len(cur) >= 2:
         chains.append(cur)
     for c in chains:
-        log(f"  🔗 成链 {len(c)} 镜（{c[0].scene_id} / {'、'.join(c[0].chars)}）: "
+        # 角色可能逐镜变化（逐段素材），所以按镜列出，别只报首镜 —— 否则看日志会误判
+        who = " → ".join("、".join(getattr(s, "chars", []) or ["空镜"]) for s in c)
+        log(f"  🔗 成链 {len(c)} 镜（{c[0].scene_id}｜{who}）: "
             + " → ".join(s.id for s in c))
     return chains
 
@@ -166,28 +189,37 @@ def new_content_starts(segs: list[dict]) -> list[int]:
 
 
 def build_timeline(
-    images: list[dict], segs: list[dict], prompts: list[str], *, fps: int = FPS,
+    images: list[dict], segs: list[dict], prompts: list[str], *,
+    seg_images: list[list[str]] | None = None, fps: int = FPS,
 ) -> dict:
-    """构造 TimelineDirector 的 timeline_data（version 4 结构，实测可跑）。"""
+    """
+    构造 TimelineDirector 的 timeline_data。
+
+    `seg_images`：**逐段参考图 id 列表**（对应 `images` 里的 id）。
+    官方预置工作流（达尔文MV）与源码 `_ordered_segment_assets` 证实：分段模式下素材按段过滤，
+    且 `<Picture N>` 编号每段从 1 重新开始 —— 所以同场景里不同角色的镜头可以各带各的图，
+    而我们的逐镜提示词本来就写的是"本镜第一个角色 = <Picture 1>"，天然对上。
+    传 None = 每段都用全部图（旧行为）。
+    """
     total = total_frames(segs)
+    rows: list[dict] = []
+    for i, (s, p) in enumerate(zip(segs, prompts)):
+        row: dict = {"startFrame": s["start"], "endFrame": s["end"], "prompt": p}
+        row["images"] = list(images and (seg_images[i] if seg_images else
+                                         [im["id"] for im in images]) or [])
+        row["audios"] = []          # 音轨我们自己混（见模块头"音频"一节）
+        rows.append(row)
     return {
         "version": 4,
         "fps": fps,
         "globalPrompt": "",
         "selection": {"start": 0, "duration": total / fps},
-        "videoAudioEnabled": False,      # 音轨我们自己混（见模块头"音频"一节）
+        "videoAudioEnabled": False,
         "videoClips": [],
         "images": images,
         "audios": [],
         "secondPass": False,
-        "segmentConfig": {
-            "count": len(segs),
-            "mode": "timeline",
-            "segments": [
-                {"startFrame": s["start"], "endFrame": s["end"], "prompt": p}
-                for s, p in zip(segs, prompts)
-            ],
-        },
+        "segmentConfig": {"count": len(segs), "mode": "timeline", "segments": rows},
     }
 
 
@@ -358,12 +390,19 @@ def chain_extra_fp(chain: list[Any], index: int, overlap: int) -> str:
 
 
 def continuity_note(overlap: int, *, fps: int = FPS) -> str:
-    """官方 `inject_continuity_instruction` 的原话 —— 让模型把开头当作上一段的延续。"""
+    """
+    段首重叠区的说明 —— 官方规范 §4.4「情况 B：重叠结束处本来就应该切镜头」的写法。
+
+    原来只写"把开头当作上一段最后一个镜头"，而我们的逐镜提示词整段描述的是**本镜**内容，
+    两者会打架（模型得猜开头 0.92s 到底演什么）。这里补一句：本提示词描述的新内容
+    **从重叠结束之后开始**，中间那一下就是切镜点 —— 换角色的链（实测接缝 41.0）正是这种情况。
+    """
     d = overlap / fps
     return (f" The opening 00:00.000-00:{d:06.3f} is a carried latent continuation "
-            "from the preceding segment. Describe this opening as the preceding segment's "
+            "from the preceding segment: treat that opening as the preceding segment's "
             "final shot, preserving character positions, environment, motion, camera path, "
-            "lighting, color, and sound before introducing new action.")
+            "lighting, colour, and sound. Everything described in this prompt begins only "
+            f"after 00:{d:06.3f}; the change at that moment is a cut, not a morph.")
 
 
 def render_chain(
@@ -400,7 +439,8 @@ def render_chain(
     work.mkdir(parents=True, exist_ok=True)
 
     # ---- 0) 需不需要渲？（三态判定，按链里任一镜为准）----
-    ref_paths = _ref_paths(proj, chain[0])
+    # 参考图按**本镜**取（链内可以换角色 —— 逐段素材各自生效）
+    seg_refs = [_ref_paths(proj, s) for s in chain]
     # 配音指纹也进镜头指纹：只改音色/音色描述也要重渲，否则"配音换了成片还是旧声音"
     vfps = [V.shot_voice_fp(proj, s) for s in chain]
 
@@ -416,7 +456,7 @@ def render_chain(
     for i, s in enumerate(chain):
         fr = segs[i]["plan_frames"]
         fps_map[s.id] = fr
-        fp = shot_fingerprint(s.prompt, s.chars, ref_paths, render, fr, s.seed,
+        fp = shot_fingerprint(s.prompt, s.chars, seg_refs[i], render, fr, s.seed,
                               extra=_extra(i))
         st = manifest.status(s.id, fp, proj.clip(s.id))
         if force or st != "current":
@@ -434,12 +474,24 @@ def render_chain(
     track = build_audio_track(wavs, starts, total, work / f"audio_{first}_{last}.wav", fps=fps, log=log)
 
     # ---- 2) 图 ----
-    ref_names = _ref_names(proj, chain[0])
-    images = [{"id": f"p{i}", "file": n, "name": n} for i, n in enumerate(ref_names)]
-    prompts = [s.prompt + (continuity_note(overlap, fps=fps) if i else "")
+    # 全局图池 + **逐段**素材清单：同场景里换角色的镜头各带各的参考图（编号每段从 1 起算）
+    ids: dict[str, str] = {}
+    images: list[dict] = []
+    seg_image_ids: list[list[str]] = []
+    for s in chain:
+        row: list[str] = []
+        for n in _ref_names(proj, s):
+            if n not in ids:
+                ids[n] = f"img{len(ids)}"
+                images.append({"id": ids[n], "file": n, "name": n})
+            row.append(ids[n])
+        seg_image_ids.append(row)
+    prompts = [_clean_prompt(s.prompt) + (continuity_note(overlap, fps=fps) if i else "")
                for i, s in enumerate(chain)]
-    timeline = build_timeline(images, segs, prompts, fps=fps)
+    timeline = build_timeline(images, segs, prompts, seg_images=seg_image_ids, fps=fps)
     wf = build_chain_workflow(params, timeline, segs, chain[0].seed, fps=fps)
+    log(f"  🖼 参考图池 {len(images)} 张；逐段素材 " +
+        " / ".join(f"{chain[i].id}:{len(r)}" for i, r in enumerate(seg_image_ids)))
 
     # ---- 3) 提交并等（提交即落盘：崩了至少能看到"链在跑"）----
     pid = comfy.submit(wf)
@@ -466,7 +518,7 @@ def render_chain(
     for i, s in enumerate(chain):
         clip = proj.clip(s.id)
         slice_shot(final, starts[i], segs[i]["new_frames"], clip, fps=fps)
-        fp = shot_fingerprint(s.prompt, s.chars, ref_paths, render, fps_map[s.id], s.seed,
+        fp = shot_fingerprint(s.prompt, s.chars, seg_refs[i], render, fps_map[s.id], s.seed,
                               extra=_extra(i))
         note = (f"链渲染（{first}→{last}，重叠 {overlap} 帧）；"
                 f"本镜损失 {segs[i]['plan_frames'] - segs[i]['new_frames']} 帧" if i else

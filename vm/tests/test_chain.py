@@ -72,14 +72,14 @@ class PlanChainsTest(unittest.TestCase):
         shots = [_s(f"s{i}", 5, ["孙悟空"]) for i in range(3)]
         self.assertEqual(len(C.plan_chains(shots, log=QUIET)), 1)
 
-    def test_different_chars_break_chain(self) -> None:
+    def test_different_chars_still_chain(self) -> None:
+        """★ 2026-09-28 修正：官方预置证明逐段素材独立、编号每段从 1 起算 —— 换角色也能成链。"""
         shots = [_s("a", 5, ["孙悟空"]), _s("b", 5, ["唐僧"]), _s("c", 5, ["孙悟空"])]
-        self.assertEqual(C.plan_chains(shots, log=QUIET), [])
+        self.assertEqual([len(c) for c in C.plan_chains(shots, log=QUIET)], [3])
 
-    def test_char_order_matters(self) -> None:
-        """顺序不同会让 <Picture N> 编号错位（画面正常但人不对）—— 必须断开。"""
+    def test_char_order_no_longer_breaks_chain(self) -> None:
         shots = [_s("a", 5, ["孙悟空", "唐僧"]), _s("b", 5, ["唐僧", "孙悟空"])]
-        self.assertEqual(C.plan_chains(shots, log=QUIET), [])
+        self.assertEqual([len(c) for c in C.plan_chains(shots, log=QUIET)], [2])
 
     def test_different_scene_breaks_chain(self) -> None:
         shots = [_s("a", 5, ["孙悟空"], "S1"), _s("b", 5, ["孙悟空"], "S2")]
@@ -145,6 +145,31 @@ class TimelineTest(unittest.TestCase):
         self.assertFalse(tl["videoAudioEnabled"], "音轨由我们混，不交给模型")
         self.assertEqual(tl["audios"], [])
         self.assertFalse(tl["secondPass"])
+
+    def test_per_segment_images(self) -> None:
+        """★ 逐段素材：换角色的链里，每段只带自己的参考图（编号每段从 1 起算）。"""
+        ch = [_s("a", 5, ["孙悟空"]), _s("b", 5, ["唐僧", "老僧"])]
+        segs = C.geometry(ch, 22)
+        imgs = [{"id": "img0", "file": "char_孙悟空.png", "name": "char_孙悟空.png"},
+                {"id": "img1", "file": "char_唐僧.png", "name": "char_唐僧.png"},
+                {"id": "img2", "file": "char_老僧.png", "name": "char_老僧.png"}]
+        tl = C.build_timeline(imgs, segs, ["P1", "P2"], seg_images=[["img0"], ["img1", "img2"]])
+        rows = tl["segmentConfig"]["segments"]
+        self.assertEqual(rows[0]["images"], ["img0"])
+        self.assertEqual(rows[1]["images"], ["img1", "img2"])
+        self.assertEqual(rows[0]["audios"], [], "音轨我们自己混")
+
+    def test_timeline_without_seg_images_uses_all(self) -> None:
+        segs = C.geometry([_s("a", 5, ["x"]), _s("b", 5, ["x"])], 22)
+        tl = C.build_timeline([{"id": "p0", "file": "f.png", "name": "f.png"}], segs, ["P1", "P2"])
+        self.assertEqual(tl["segmentConfig"]["segments"][1]["images"], ["p0"])
+
+    def test_clean_prompt_strips_markdown_fences(self) -> None:
+        """官方预置（达尔文MV）第 2–8 段 prompt 里混进了 ```text —— 防御性清洗。"""
+        dirty = "subject_definitions:\n<Subject 1> ...\n```text\nsummary: x\n```\nend"
+        self.assertNotIn("```", C._clean_prompt(dirty))
+        self.assertIn("summary: x", C._clean_prompt(dirty))
+        self.assertEqual(C._clean_prompt(""), "")
 
     def test_continuity_note_mentions_overlap_seconds(self) -> None:
         note = C.continuity_note(22)
