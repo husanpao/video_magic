@@ -247,11 +247,12 @@ SCHEMA: tuple[Item, ...] = (
     ),
     _it(
         "llm.max_tokens", "模型", "LLM 单次输出上限（max_tokens）", "int", None,
-        what="拆镜/改写时单次回复的最大 token 数。**留空 = 内置 8192**（deepseek-chat 的上限）。",
-        effect="报「LLM 输出被 max_tokens 截断」时调大（章节长、镜头多时容易顶到）；"
-               "只在你的模型支持更大输出时有效 —— 填超过接口上限会被直接拒绝。",
+        what="拆镜/改写时单次回复的最大 token 数。**留空 = 内置 131072**"
+             "（2026-09-28 实测：本机接口接受到 393216 都不报错；旧版写死 8192 会让长章节被截断）。",
+        effect="这一项是**上限不是预留额度**，写大不会多花钱，只影响「允许最长输出多少」；"
+               "换到输出上限更小的模型时接口会 400，程序会自动降级重试，不需要你猜。",
         stale="不进镜头指纹；下次拆镜/改写生效。",
-        nullable=True, minimum=1024, maximum=131072,
+        nullable=True, minimum=1024, maximum=393216,
     ),
     _it(
         "vae_video", "模型", "视频 VAE", "str", "minimax_h3_video_vae_fp16.safetensors",

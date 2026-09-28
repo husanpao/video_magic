@@ -93,7 +93,12 @@ DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-chat"
 KEY_FILE = Path("~/.config/video_magic/deepseek_key")
 
-MAX_TOKENS = 8192  # deepseek-chat 上限 8192；拆镜表分块输出，单次不会顶到
+# ★ 2026-09-28 实测纠正：这里原来写死 8192，注释还写着「deepseek-chat 上限 8192」—— **过时**。
+#   本机实测当前接口 max_tokens 一路到 393216（384K）都不报错。默认给 131072：
+#   max_tokens 只是"上限"不是"预留额度"，写大不会多花钱；而被截断的代价（整章拆镜
+#   失败 + 已花的 token 白扔 + 用户来回折腾）远高于它。换到输出上限更小的模型时，
+#   `_llm_json` 会按接口的 400 报错**自动降级重试**，不需要用户去猜。
+MAX_TOKENS = 131072
 LLM_TIMEOUT = 300
 MAX_ATTEMPTS = 3  # 瞬时失败（429/5xx/网络）指数退避重试，别让一次抖动打断整章
 DEFAULT_TEMPERATURE = 0.3
@@ -279,20 +284,18 @@ def _llm_json(
     temperature = float(llm.get("temperature", temperature))
     max_tokens = int(llm.get("max_tokens") or MAX_TOKENS)
 
-    body = json.dumps(
-        {
-            "model": model,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "response_format": {"type": "json_object"},
-            "stream": False,
-        },
-        ensure_ascii=False,
-    ).encode("utf-8")
+    payload: dict = {
+        "model": model,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "response_format": {"type": "json_object"},
+        "stream": False,
+    }
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     url = base + "/chat/completions"
     key = api_key()
 
@@ -336,6 +339,15 @@ def _llm_json(
                 detail = e.read(2000).decode("utf-8", "replace")
             except Exception:  # noqa: BLE001 - 读错误体失败不影响主流程
                 pass
+            if e.code == 400 and "max_tokens" in detail and max_tokens > 4096:
+                # ★ 换到"输出上限更小"的模型时，接口会对过大的 max_tokens 直接 400。
+                #   自动降级重试，而不是让用户去猜该填多少（默认 131072 才敢给这么大）。
+                old = max_tokens
+                max_tokens = max(4096, max_tokens // 8)
+                payload["max_tokens"] = max_tokens
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                _log(log, f"  ⚠️ 接口拒绝 max_tokens={old}，自动降级为 {max_tokens} 重试")
+                continue
             if e.code == 429 or e.code >= 500:
                 last_err = f"HTTP {e.code}: {detail[:200]}"
                 _log(log, f"  ⚠️ DeepSeek {last_err}，{attempt * 2}s 后重试（{attempt}/{MAX_ATTEMPTS}）")
@@ -1431,6 +1443,31 @@ def _chunk_text(text: str, limit: int = CHUNK_CHARS) -> list[str]:
     if buf:
         chunks.append(buf)
     return chunks or ([text.strip()] if text.strip() else [])
+
+
+MIN_SPLIT_CHARS = 500
+
+
+def _is_truncation(err: BaseException) -> bool:
+    """是不是 max_tokens 截断 —— 只有它值得"二分重试"，其它错误二分也没用。"""
+    s = str(err)
+    return "截断" in s or "max_tokens" in s
+
+
+def _split_chunk_text(text: str) -> list[str]:
+    """把一个块二分成两块（段落边界优先，其次句边界）；太短/切不出就返回 []。"""
+    if len(text) < MIN_SPLIT_CHARS * 2:
+        return []
+    mid = len(text) // 2
+    for pat in (r"\n\s*\n", r"(?<=[。！？.!?])"):
+        cut, best = None, None
+        for m in re.finditer(pat, text):
+            d = abs(m.end() - mid)
+            if best is None or d < best:
+                best, cut = d, m.end()
+        if cut and MIN_SPLIT_CHARS <= cut <= len(text) - MIN_SPLIT_CHARS:
+            return [text[:cut].strip(), text[cut:].strip()]
+    return []
 
 
 _CN_DIGITS = {
@@ -2701,11 +2738,18 @@ def plan_chapter(
                        "chapters": list(c.chapters or [])} for c in props]
 
     # ── 阶段①：分块拆镜表 ──
-    chunks = _chunk_text(chapter_text)
+    # ★ 用「待处理队列」而不是固定 chunks：某块被 max_tokens 截断时，把这块**二分成两块**
+    #   插回队首重试（自愈）—— 2026-09-28《西游记》实测：1745 字整章一块时首稿就顶到 8192，
+    #   输出长度只取决于"这一块要写多少镜"，切小就装得下，不必让用户去猜 CHUNK_CHARS。
+    pending: list[str] = _chunk_text(chapter_text)
     shots_rows: list[dict] = []
     scene_offset = 0
-    for ci, chunk in enumerate(chunks, 1):
-        _log(log, f"  ✂️ 拆镜第 {ci}/{len(chunks)} 块（{len(chunk)} 字）…")
+    ci = 0
+    while pending:
+        chunk = pending.pop(0)
+        ci += 1
+        chunk_total = ci + len(pending)
+        _log(log, f"  ✂️ 拆镜第 {ci}/{chunk_total} 块（{len(chunk)} 字）…")
         feedback = ""
         rows: list[dict] = []
         cards_out: list[dict] = []
@@ -2713,13 +2757,14 @@ def plan_chapter(
         issues: list[str] = []
         style_issues: list[str] = []
         fallback: dict | None = None  # 第 1 稿已合格时的快照，供第 2 稿失败兜底
+        resplit = False                # 本块被截断 → 已二分插回队列，跳过后续处理
         for round_no in (1, 2):
             try:
                 obj, meta = _llm_json(
                     cfg,
                     TABLE_SYSTEM,
                     _table_user_prompt(
-                        title=title, chapter_text=chunk, chunk_no=ci, chunk_total=len(chunks),
+                        title=title, chapter_text=chunk, chunk_no=ci, chunk_total=chunk_total,
                         cards=cards, allowed=allowed, style=style,
                         unknown_so_far=stats["unknown_characters"], allow_new=allow_new,
                         feedback=feedback, scenes=scenes, props=props,
@@ -2728,9 +2773,19 @@ def plan_chapter(
                     log=log, tag=f"拆镜表 块{ci} 第{round_no}稿",
                 )
             except PlanError as e:
-                # ★ 2026-09-28 事故的兜底：重写轮失败（最常见是被 max_tokens 截断）
-                #   **绝不能连累已经合格的第一稿** —— 有快照就采用它继续，只告警。
-                #   没有快照（第一稿就失败/第一稿本身有硬问题）才真的抛。
+                # ★ 首选自愈：首稿就被 max_tokens 截断 → 把这块二分成两块插回队首，
+                #   而不是整章失败。块变小 = 输出变短 = 装得下。
+                if fallback is None and _is_truncation(e):
+                    halves = _split_chunk_text(chunk)
+                    if len(halves) == 2:
+                        pending = halves + pending
+                        resplit = True
+                        ci -= 1  # 本块没产出，编号让给它的后半
+                        _log(log, f"    ⚠️ 块被 max_tokens 截断，自动二分重试："
+                                  f"{len(chunk)} 字 → {len(halves[0])}+{len(halves[1])} 字")
+                        stats["warnings"].append(f"拆镜块被截断，已自动二分（原 {len(chunk)} 字）")
+                        break
+                # 次选兜底：重写轮失败（最常见也是截断）不能连累已经合格的第一稿
                 if fallback is None:
                     raise
                 _log(log, f"    ⚠️ 块 {ci} 第 {round_no} 稿失败（{e}），"
@@ -2810,6 +2865,8 @@ def plan_chapter(
             if fix:
                 _log(log, f"    ⚠️ 块 {ci} 重写后仍有待改问题：{fix[0][:100]}")
             break
+        if resplit:
+            continue
         stats["warnings"].extend(f"第 {ci} 块：{s}" for s in style_issues)
 
         for u in unknown:
