@@ -486,6 +486,23 @@ def render_shot(
     return clip, "rendered"
 
 
+def _render_units(shots: list, chains: list[list]) -> list[tuple[str, list]]:
+    """
+    把「镜头表 + 链」编成执行单元，**保持表中顺序**。
+
+    链里的镜头不再单独出现（由链统一处理）；没进链的镜头各自成一个单元。
+    """
+    by_first = {c[0].id: c for c in chains}
+    consumed = {s.id for c in chains for s in c}
+    units: list[tuple[str, list]] = []
+    for s in shots:
+        if s.id in by_first:
+            units.append(("chain", by_first[s.id]))
+        elif s.id not in consumed:
+            units.append(("shot", [s]))
+    return units
+
+
 def render_all(
     proj: Project,
     params: dict,
@@ -545,14 +562,29 @@ def render_all(
     ck = proj.checkpoint
     result = {"rendered": [], "skipped": [], "reclaimed": [], "failed": []}
 
-    log(f"===== 渲染 {len(shots)} 个镜头（force={force}, dry={dry}）=====")
-    t0 = time.time()
-    for i, shot in enumerate(shots, 1):
-        log(f"[{i}/{len(shots)}] {shot.id}")
-        if dry:
-            frames = seconds_to_frames(shot.sec)
-            log(f"  · dry-run：{shot.sec}s→{frames}帧，参考图 {[c for c in shot.chars]}")
-            continue
+    # ── 链渲染（社区 MiniMaxH3-TimelineDirector，2026-09-28）──────────────────
+    # 同场景、同角色、相邻的镜头合到**一次** ComfyUI 执行里生成：靠固定重叠帧 +
+    # 原生 AV latent 续接消除硬切（原来每镜独立生成，观众看得出"不是一场戏"）。
+    # 关开关 / dry-run / ComfyUI 缺节点 → 一律退回单镜路径（不静默降级：会说原因）。
+    from . import chain as _chain
+    chains: list[list] = []
+    if not dry and bool(params.get("chain_render")):
+        _miss = _chain.missing_nodes(comfy)
+        if _miss:
+            log(f"  · 链渲染不可用（ComfyUI 缺节点：{', '.join(_miss)}）→ 全部走单镜渲染")
+        else:
+            chains = _chain.plan_chains(
+                shots, is_locked=manifest.is_locked,
+                max_shots=int(params.get("chain_max_shots") or _chain.DEFAULT_MAX_SHOTS),
+                log=log,
+            )
+            if not chains:
+                log("  · 没有可成链的镜头（需同场景+同角色+相邻）→ 全部走单镜渲染")
+    overlap = int(params.get("chain_overlap_frames") or _chain.DEFAULT_OVERLAP_FRAMES)
+    units = _render_units(shots, chains)
+
+    def _one(shot) -> None:
+        """单镜路径（原逻辑，链失败时也用它兜底）。"""
         try:
             _path, action = render_shot(
                 proj, shot, params, comfy, manifest, ck, log,
@@ -565,6 +597,34 @@ def render_all(
         except Exception as e:  # 单个镜头出意外不该拖垮整批
             log(f"  ❌ {shot.id} 异常: {e!r}")
             result["failed"].append(shot.id)
+
+    log(f"===== 渲染 {len(shots)} 个镜头（force={force}, dry={dry}）"
+        + (f"，编成 {len(chains)} 条链" if chains else "") + " =====")
+    t0 = time.time()
+    for i, (kind, group) in enumerate(units, 1):
+        label = group[0].id if kind == "shot" else f"链 {group[0].id} → {group[-1].id}"
+        log(f"[{i}/{len(units)}] {label}")
+        if dry:
+            for shot in group:
+                frames = seconds_to_frames(shot.sec)
+                log(f"  · dry-run：{shot.id} {shot.sec}s→{frames}帧，参考图 {[c for c in shot.chars]}")
+            continue
+        if kind == "chain":
+            try:
+                out = _chain.render_chain(
+                    proj, group, params, comfy, manifest, ck, log,
+                    force=force, overlap=overlap,
+                    on_tick=on_tick, should_stop=should_stop,
+                )
+                result["rendered"].extend(out["rendered"])
+                result["skipped"].extend(out["skipped"])
+            except Exception as e:  # noqa: BLE001
+                # 链失败**不能**吞掉这些镜头：逐镜补渲（宁可没连贯，不可没产物）
+                log(f"  ⚠️ 链渲染失败（{type(e).__name__}: {e}）→ 回退单镜渲染这 {len(group)} 镜")
+                for shot in group:
+                    _one(shot)
+            continue
+        _one(group[0])
 
     el = time.time() - t0
     log(

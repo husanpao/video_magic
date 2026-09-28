@@ -74,10 +74,16 @@ def shot_fingerprint(
     render: dict,
     frames: int,
     seed: int,
+    *,
+    extra: str = "",
 ) -> str:
     """
     计算单个镜头的输入指纹。字段顺序固定，保证可复现。
     `render` 里取会影响画面的子集（模型/LoRA/步数/分辨率），不取端口之类无关项。
+
+    `extra`：链渲染的上下文摘要（见 `vm/chain.py:chain_extra_fp`）。
+    **只有非空才参与哈希** —— 没成链的镜头指纹与老版本逐字节一致，
+    所以启用链渲染不会让已有产物无辜变 stale。
     """
     parts = [
         "v1",
@@ -92,6 +98,8 @@ def shot_fingerprint(
         "frames=" + str(frames),
         "seed=" + str(seed),
     ]
+    if extra:
+        parts.append("chain=" + extra)
     return hashlib.md5("\n".join(parts).encode("utf-8")).hexdigest()[:16]
 
 

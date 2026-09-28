@@ -181,8 +181,32 @@ SCHEMA: tuple[Item, ...] = (
         stale_impact=True, minimum=8, maximum=60,
     ),
     _it(
-        "steps", "渲染", "采样步数", "int", 8,
-        what="渲染采样步数（turbo LoRA 配 8 步）。",
+        "chain_render", "渲染", "连贯链式渲染", "bool", False,
+        what="把**同场景、同角色、相邻**的镜头合成一条链，用社区 MiniMaxH3-TimelineDirector "
+             "工作流一次生成（固定重叠帧 + 原生 AV latent 续接），出片后自动切回逐镜 clips。",
+        effect="开启后镜头之间不再是硬切（本机实测接缝帧差 1.3–2.3，全片中位 1.01，肉眼无跳变）；"
+               "代价：每链一次执行、链内任一镜变动整链重渲。需要 ComfyUI 装该节点包，"
+               "缺节点会自动退回单镜渲染并说明原因。",
+        stale="⚠️ 会 —— 链内第 2 镜起的指纹含前序上下文，开启后这些镜头变「需重渲」。",
+        stale_impact=True,
+    ),
+    _it(
+        "chain_max_shots", "渲染", "每链最多镜头数", "int", 3,
+        what="一条链里最多几镜。",
+        effect="越大越连贯、单次执行越久、失败代价越大（链内全部重渲）。本机实测 3 镜一条链约 110 秒。",
+        stale="不进指纹（只影响编组；编组变了会体现为下次渲染的链上下文变化）。",
+        minimum=2, maximum=8,
+    ),
+    _it(
+        "chain_overlap_frames", "渲染", "链重叠帧数", "int", 22,
+        what="相邻镜头之间固定重叠多少帧（H3 格点 5+17k：5 / 22 / 39 / 56）。",
+        effect="越大越稳（官方默认 22 ≈ 0.92s）。去重后每镜实际输出比计划少 5 帧（约 0.21s），"
+               "拼片与字幕一律以 sec_actual 为准。",
+        stale="⚠️ 会（进链上下文指纹）。",
+        stale_impact=True, minimum=5, maximum=56,
+    ),
+    _it(
+        "steps", "渲染", "采样步数", "int", 8,        what="渲染采样步数（turbo LoRA 配 8 步）。",
         effect="步数越高细节越多、每镜耗时线性上涨。用 turbo LoRA 时 8 步是实测甜点；去掉 LoRA 要把步数提上去。",
         stale="⚠️ 会。全部已生成镜头变「需重渲」。",
         stale_impact=True, minimum=1, maximum=40,
