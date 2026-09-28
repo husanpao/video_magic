@@ -132,8 +132,10 @@ def speaker_of(shot: Any) -> str:
 
 
 def voice_fingerprint(text: str, speaker: str, desc: str, cfg: VoiceConfig) -> str:
+    # v2：产物改为"去首尾静音"之后处理（2026-09-28）—— 升版本让 v1 的旧 wav 自动失效，
+    # 否则缓存只比 fp，会把还挂着 1~3 秒静音的旧配音一直用下去。
     parts = [
-        "voice-v1",
+        "voice-v2",
         "text=" + (text or ""),
         "speaker=" + (speaker or ""),
         "desc=" + (desc or ""),
