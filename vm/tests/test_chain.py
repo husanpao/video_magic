@@ -196,6 +196,37 @@ class VoiceTest(unittest.TestCase):
                                      "vae_audio": "a"}, 5.0)
         self.assertEqual(wf["5"]["inputs"]["speaker_id"], "孙悟空")
 
+    def test_no_dialogue_means_no_voice(self) -> None:
+        class _P:
+            root = "/tmp"
+
+        shot = _s("a", 5, ["x"])
+        self.assertEqual(V.shot_voice_fp(_P(), shot), "")
+        shot.dialogue = "你好"
+        self.assertNotEqual(V.shot_voice_fp(_P(), shot), "")
+
+    def test_silence_trimmed_and_speech_measured(self) -> None:
+        """
+        ★ 回归：SpeechStudio 会给足余量（计划+0.4s，下限 5.17s），首尾挂静音。
+        实测 4 字台词产物 5.88s 里有 1.3s 静音 —— 不去掉会让"这句装不装得进镜头"判断失真。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            raw = Path(td) / "raw.wav"
+            subprocess.run([
+                "ffmpeg", "-y", "-v", "error",
+                "-f", "lavfi", "-i", "anullsrc=r=32000:cl=stereo:d=0.4",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=0.6",
+                "-f", "lavfi", "-i", "anullsrc=r=32000:cl=stereo:d=0.8",
+                "-filter_complex", "[0][1][2]concat=n=3:v=0:a=1[out]", "-map", "[out]",
+                "-ar", "32000", "-ac", "2", str(raw)], check=True)
+            self.assertAlmostEqual(V.wav_duration(raw), 1.8, places=1)
+            self.assertAlmostEqual(V.speech_seconds(raw), 0.6, places=1,
+                                   msg="净语音长度 = 尾静音起点 − 首静音终点")
+            out = Path(td) / "trim.wav"
+            V._to_wav32k(raw, out)
+            self.assertLess(V.wav_duration(out), V.wav_duration(raw), "静音没被去掉")
+            self.assertLess(V.wav_duration(out), 1.2)
+
 
 class AudioTrackTest(unittest.TestCase):
     """无台词必须出**静音轨**（绝不让模型自己编台词 —— 那正是"嘴说话对不上"的根源）。"""

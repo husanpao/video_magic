@@ -255,24 +255,100 @@ def synthesize(
         _to_wav32k(tmp, out)
     finally:
         tmp.unlink(missing_ok=True)
+    # speech 记"实际会混进成片的音频长度"（已去首尾静音的 wav 时长），
+    # 这样"台词装不装得进这个镜头"的判断与实际混音一致。
+    sp = wav_duration(out)
     _meta_path(proj, shot.id).write_text(
-        json.dumps({"fp": fp, "text": text, "speaker": speaker, "desc": desc},
-                   ensure_ascii=False, indent=1),
+        json.dumps({"fp": fp, "text": text, "speaker": speaker, "desc": desc,
+                    "speech": round(sp, 3)}, ensure_ascii=False, indent=1),
         encoding="utf-8",
     )
-    log(f"    🗣 配音完成 {out.name}（{speaker}「{text[:16]}」）")
+    warn = f"　⚠️ 语音 {sp:.2f}s > 镜头 {seconds:.2f}s，尾部会被裁（该拆镜或加长镜头）" if sp > seconds else ""
+    log(f"    🗣 配音完成 {out.name}（{speaker}「{text[:16]}」语音 {sp:.2f}s / 镜头 {seconds:.2f}s）{warn}")
     return out
 
 
 def _to_wav32k(src: Path, dst: Path) -> None:
-    """统一成 32kHz 立体声 s16 —— drive_audio / 混音都按这个口径。"""
+    """
+    统一成 32kHz 立体声 s16，并**去掉首尾静音**。
+
+    为什么必须去：SpeechStudio 的 `render_seconds` 是"给足余量"的（计划时长 + 0.4s，下限 5.17s），
+    所以原始产物首尾往往挂着 1~3 秒静音。实测 4 字台词「庙里有人。」原始 5.88s 里有 1.3s 静音，
+    直接混进镜头会让"这句话到底该多长"判断失真，也更容易被镜头边界裁掉尾巴。
+
+    实现用"正向去头 + 反转去尾"的经典写法（silenceremove 的 stop_* 语义易踩坑），
+    并各自留一点余量：头 50ms、尾 150ms —— 呼吸/气口保留，纯静音不留。
+    """
+    filt = (
+        "silenceremove=start_periods=1:start_threshold=-40dB:start_silence=0.05,"
+        "areverse,"
+        "silenceremove=start_periods=1:start_threshold=-40dB:start_silence=0.15,"
+        "areverse"
+    )
     r = subprocess.run(
-        ["ffmpeg", "-y", "-v", "error", "-i", str(src), "-ar", "32000", "-ac", "2",
-         "-c:a", "pcm_s16le", str(dst)],
+        ["ffmpeg", "-y", "-v", "error", "-i", str(src), "-af", filt,
+         "-ar", "32000", "-ac", "2", "-c:a", "pcm_s16le", str(dst)],
         capture_output=True, text=True,
     )
     if r.returncode != 0 or not dst.is_file():
         raise ComfyError(f"配音转码失败：{r.stderr.strip()[:200]}")
+
+
+def wav_duration(path: Path) -> float:
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                        "-of", "default=nw=1:nk=1", str(path)], capture_output=True, text=True)
+    try:
+        return float(r.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
+def speech_seconds(path: Path, *, noise: str = "-40dB", min_sil: float = 0.15) -> float:
+    """
+    语音**净长度** = 尾静音起点 − 首静音终点（首尾静音都不算）。
+
+    用来判断"这句话装不装得进这个镜头"：
+    长度 > 镜头秒数 → 尾部会被裁，该拆镜或加长镜头（`synthesize` 会打这条告警）。
+    """
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-i", str(path), "-af",
+                        f"silencedetect=noise={noise}:d={min_sil}", "-f", "null", "-"],
+                       capture_output=True, text=True)
+    total = wav_duration(path)
+    starts = [float(x) for x in re.findall(r"silence_start: ([0-9.]+)", r.stderr)]
+    ends = [float(x) for x in re.findall(r"silence_end: ([0-9.]+)", r.stderr)]
+    lead_end = ends[0] if (starts and ends and starts[0] <= 0.05) else 0.0
+    tail_start = total
+    for s, e in zip(starts, ends):
+        if abs(e - total) < 0.1:
+            tail_start = s
+    return max(0.0, tail_start - lead_end)
+
+
+def shot_voice_fp(proj: Any, shot: Any, cfg: VoiceConfig | None = None) -> str:
+    """
+    这一镜的配音指纹（无台词 → ""）。
+
+    链渲染把它并进镜头指纹：**只改音色/只改台词描述也会让该镜重渲**，
+    否则会出现"配音换了但成片还是旧声音"这种最难查的不一致。
+    """
+    text = ((getattr(shot, "dialogue", "") or "").strip()
+            or (getattr(shot, "narration", "") or "").strip())
+    if not text:
+        return ""
+    cfg = cfg or VoiceConfig(voice_overrides=load_voice_overrides(proj))
+    speaker = speaker_of(shot)
+    desc = voice_description(speaker, getattr(shot, "char_appearance", "") or "", cfg)
+    return voice_fingerprint(text, speaker, desc, cfg)
+
+
+def recorded_speech(proj: Any, shot_id: str) -> float | None:
+    """读 sidecar 里记的语音实际时长（没跑过配音 → None）。"""
+    try:
+        meta = json.loads(_meta_path(proj, shot_id).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    v = meta.get("speech")
+    return float(v) if isinstance(v, (int, float)) else None
 
 
 def probe(comfy: Comfy) -> list[str]:

@@ -401,6 +401,15 @@ def render_chain(
 
     # ---- 0) 需不需要渲？（三态判定，按链里任一镜为准）----
     ref_paths = _ref_paths(proj, chain[0])
+    # 配音指纹也进镜头指纹：只改音色/音色描述也要重渲，否则"配音换了成片还是旧声音"
+    vfps = [V.shot_voice_fp(proj, s) for s in chain]
+
+    def _extra(i: int) -> str:
+        return "|".join(p for p in (
+            chain_extra_fp(chain, i, overlap),
+            f"voice={vfps[i]}" if vfps[i] else "",
+        ) if p)
+
     render = params
     pending: list[int] = []
     fps_map: dict[str, int] = {}
@@ -408,7 +417,7 @@ def render_chain(
         fr = segs[i]["plan_frames"]
         fps_map[s.id] = fr
         fp = shot_fingerprint(s.prompt, s.chars, ref_paths, render, fr, s.seed,
-                              extra=chain_extra_fp(chain, i, overlap))
+                              extra=_extra(i))
         st = manifest.status(s.id, fp, proj.clip(s.id))
         if force or st != "current":
             pending.append(i)
@@ -458,7 +467,7 @@ def render_chain(
         clip = proj.clip(s.id)
         slice_shot(final, starts[i], segs[i]["new_frames"], clip, fps=fps)
         fp = shot_fingerprint(s.prompt, s.chars, ref_paths, render, fps_map[s.id], s.seed,
-                              extra=chain_extra_fp(chain, i, overlap))
+                              extra=_extra(i))
         note = (f"链渲染（{first}→{last}，重叠 {overlap} 帧）；"
                 f"本镜损失 {segs[i]['plan_frames'] - segs[i]['new_frames']} 帧" if i else
                 f"链渲染首镜（{first}→{last}）")
