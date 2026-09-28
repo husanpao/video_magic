@@ -1,5 +1,5 @@
 <template>
-  <div class="tabroot">
+  <div class="tabroot" :class="{ wide }">
     <div class="summary">
       <template v-if="!eps.length">还没有成片</template>
       <template v-else>
@@ -34,7 +34,7 @@
           controls
           preload="metadata"
           :src="videoUrl"
-          @loadedmetadata="syncNow"
+          @loadedmetadata="onMeta"
           @timeupdate="syncNow"
           @seeked="syncNow"
         ></video>
@@ -43,7 +43,7 @@
              段底色按质检/状态：绿(通过) / 黄(可疑·需重渲) / 红(不合格·缺产物)。
              ★ U8（2026-09-25）：整条可**拖拽 scrub**（按下拖动即连续定位），
              hover 弹出该镜缩略图+台词，点段联动 state.selected（镜头表/胶片条跟着亮）。 -->
-        <div ref="wrapEl" class="segwrap">
+        <div ref="wrapEl" class="segwrap" @mouseleave="onLeave">
           <div
             ref="barEl"
             class="segbar"
@@ -52,7 +52,6 @@
             aria-label="分镜进度条：点段跳转，按住左右拖动可逐帧定位"
             @pointerdown="onDown"
             @pointermove="onMove"
-            @mouseleave="onLeave"
           >
             <div
               v-for="seg in segs"
@@ -81,7 +80,9 @@
           </div>
 
           <!-- hover 预览卡：该镜缩略图 + 台词（U8 的核心 —— 不用点开弹层就能"看见这一镜说什么"）。
-               放在 segwrap 内、segbar 之上：鼠标从条移向卡片时不算离开，卡片不会闪没。 -->
+               放在 segwrap 内、segbar 之上：鼠标从条移向卡片时不算离开，卡片不会闪没。
+               ★ 所以「收起」必须绑在 segwrap 上（`@mouseleave` 曾在 segbar 上：
+                 移向卡片途中就触发了，卡片闪没 → 预览卡上的「详情」根本点不到）。 -->
           <div
             v-if="hoverSeg"
             class="segpreview"
@@ -131,10 +132,14 @@
  *     打断审片；真要编辑点预览卡上的「详情」。
  *
  * `state.final` 与 `state.shots` 都由 App.vue 的轮询维护，这里不拉数据。
+ *
+ * ★ W4 审片屏把它**整块搬到全屏**（`wide`）。同一段代码两个用途，不是复制一份：
+ *   右栏 420px 里播放器只有 260px 高，逐镜查问题时要靠它放大看画面细节，
+ *   而"点一条质检问题 → 直接播到那一镜"只有在这里才成立（工作台那一侧没有播放器）。
  */
 import { computed, onUnmounted, ref, watch } from 'vue'
 import { api } from '@/api/client'
-import { fmtMmSs, fmtSize, kindInfo, kindOf, segTimeline, state } from '@/stores/app'
+import { chapterOf, fmtMmSs, fmtSize, kindInfo, kindOf, segTimeline, state } from '@/stores/app'
 import { openShot } from '@/stores/ui'
 
 interface Seg {
@@ -152,6 +157,8 @@ interface Seg {
   startText: string
 }
 
+defineProps<{ wide?: boolean }>()
+
 const videoEl = ref<HTMLVideoElement | null>(null)
 const barEl = ref<HTMLElement | null>(null)
 const wrapEl = ref<HTMLElement | null>(null)
@@ -160,6 +167,8 @@ const cur = ref(0)
 const duration = ref(0)
 /** hover 预览：只存段号与横向位置（内容由 segs 派生，不重复存）。 */
 const hover = ref<{ i: number; x: number } | null>(null)
+/** 等元数据到位后要补跳的那一镜（跨集跳转 / 首帧未到时的点行跳转）。 */
+const pendingShot = ref('')
 
 const eps = computed(() => state.finals || [])
 const current = ref('')
@@ -169,14 +178,31 @@ watch(eps, (v) => { if (v.length && !v.some((e) => e.stem === current.value)) cu
 const currentEp = computed(() => eps.value.find((e) => e.stem === current.value) || eps.value[eps.value.length - 1])
 const videoUrl = computed(() => api.finalUrl(state.project, currentEp.value?.stem || 'EP01'))
 const downloadUrl = computed(() => api.finalDownloadUrl(state.project, currentEp.value?.stem || 'EP01'))
-/** 重新合成后 mtime/size 变 → 换 key 强制重建 <video>，否则还播着旧文件。 */
+/** 换集也要重建 `<video>`（`current` 以前不进 key —— 只靠 :src 变化在部分浏览器上不会干净重载）。 */
 const videoKey = computed(() =>
-  state.final ? `${state.final.mtime}:${state.final.size}` : 'none')
+  `${current.value}:${state.final ? `${state.final.mtime}:${state.final.size}` : 'none'}`)
+
+/**
+ * ★ 分段时间线的镜头清单 = **所选那一集**的镜头，不是全片。
+ *
+ * 一集一章（`pipeline.py` 的 `stage_assemble`：`shots/chapterNN.json` → `EPnn.mp4`）。
+ * 原来这里直接拿 `state.shots` 全表算 `cum/total`，于是 2 集项目里播 EP02（2 镜）
+ * 却画着 6 段、按比例尺也整套错了 —— 段宽、点段跳转、播放头高亮三处一起偏。
+ * 单集项目不过滤（`chs=[0]` 的退回路径同样是单集：整片就是全部镜头）。
+ */
+const epChapter = computed(() => {
+  if (eps.value.length <= 1) return 0
+  return Number((current.value.match(/\d+/) || [''])[0]) || 0
+})
+const epShots = computed(() => {
+  const no = epChapter.value
+  return no ? state.shots.filter((s) => chapterOf(s.id) === no) : state.shots
+})
 const mtimeText = computed(() =>
   state.final ? new Date(state.final.mtime * 1000).toLocaleString() : '')
 
 const segs = computed<Seg[]>(() => {
-  const shots = state.shots
+  const shots = epShots.value
   if (!shots.length) return []
   const { cum, total } = segTimeline(shots)
   const durs = shots.map((s) => Number(s.sec_actual || s.sec || 0))
@@ -212,7 +238,7 @@ const hoverSeg = computed(() => (hover.value ? segs.value[hover.value.i] : null)
 const hoverX = computed(() => hover.value?.x ?? 0)
 
 const nowText = computed(() => {
-  const shots = state.shots
+  const shots = epShots.value
   const s = shots[cur.value]
   if (!duration.value || !shots.length || !s) return '点任意分段跳到该镜'
   const { cum } = segTimeline(shots)
@@ -224,7 +250,7 @@ function syncNow() {
   const v = videoEl.value
   if (!v) return
   duration.value = Number.isFinite(v.duration) ? v.duration : 0
-  const { cum, total } = segTimeline(state.shots)
+  const { cum, total } = segTimeline(epShots.value)
   if (!cum.length) return
   // 累计时长与成片实际时长的微小差异按比例缩放，否则越往后越偏
   const scale = total > 0 && v.duration > 0 ? v.duration / total : 1
@@ -238,7 +264,7 @@ function syncNow() {
 function seek(i: number) {
   const v = videoEl.value
   if (!v || !v.duration) return
-  const { cum, total } = segTimeline(state.shots)
+  const { cum, total } = segTimeline(epShots.value)
   const scale = total > 0 ? v.duration / total : 1
   v.currentTime = (cum[i] ?? 0) * scale
   cur.value = i
@@ -253,12 +279,12 @@ function timeAt(clientX: number): number {
   if (!el) return 0
   const r = el.getBoundingClientRect()
   const frac = r.width > 0 ? Math.min(1, Math.max(0, (clientX - r.left) / r.width)) : 0
-  const { total } = segTimeline(state.shots)
+  const { total } = segTimeline(epShots.value)
   return frac * total
 }
 
 function segIndexAt(t: number): number {
-  const { cum } = segTimeline(state.shots)
+  const { cum } = segTimeline(epShots.value)
   let i = 0
   for (let k = 0; k < cum.length; k++) if (t + 1e-6 >= cum[k]) i = k
   return i
@@ -278,7 +304,7 @@ function segCenterX(i: number): number {
 }
 
 function selectSeg(i: number) {
-  const s = state.shots[i]
+  const s = epShots.value[i]
   // 联动：镜头表 / 胶片条 / ShotNav 都在 watch state.selected
   if (s && state.selected !== s.id) state.selected = s.id
 }
@@ -287,7 +313,7 @@ function selectSeg(i: number) {
 function scrubTo(clientX: number) {
   const v = videoEl.value
   if (!v || !v.duration) return
-  const { total } = segTimeline(state.shots)
+  const { total } = segTimeline(epShots.value)
   const scale = total > 0 ? v.duration / total : 1
   const t = timeAt(clientX)
   v.currentTime = t * scale
@@ -352,13 +378,53 @@ function openDetail() {
   if (s) openShot(s.id)
 }
 
+/**
+ * W4 审片屏用：把播放头定位到某一镜（点质检/审计里的 finding 就跳到那一镜）。
+ *
+ * ★ 与「点段」的区别：点段的输入是段号，这里的输入是**镜头 id**，
+ *   而 finding 里的 id 可能属于**另一集**（一集一章）——
+ *   那种情况先把 `current` 切到那一集，`<video>` 重载后由 `onMeta` 补跳。
+ *   不切集的话会在 EP01 的文件里按 EP02 的比例尺定位，跳到完全错误的地方还一切"看起来正常"。
+ * 找不到（该集根本不存在 / 镜头 id 不属于本项目）返回 false，由调用方给用户看原因。
+ */
+function seekToShot(id: string): boolean {
+  const i = epShots.value.findIndex((s) => s.id === id)
+  if (i >= 0) {
+    selectSeg(i)
+    const v = videoEl.value
+    if (v && v.duration) seek(i)
+    else pendingShot.value = id // `preload="metadata"` 还没到位：到了再跳
+    return true
+  }
+  const stem = `EP${String(chapterOf(id)).padStart(2, '0')}`
+  if (!eps.value.some((e) => e.stem === stem)) return false
+  pendingShot.value = id
+  current.value = stem
+  return true
+}
+
+/** loadedmetadata：先按新时长校准播放头，再补上那一次待跳（跨集跳转走的就是这条路）。 */
+function onMeta() {
+  syncNow()
+  const id = pendingShot.value
+  if (!id) return
+  pendingShot.value = ''
+  const i = epShots.value.findIndex((s) => s.id === id)
+  if (i >= 0) {
+    selectSeg(i)
+    seek(i)
+  }
+}
+
+defineExpose({ seekToShot })
+
 onUnmounted(() => {
   window.removeEventListener('pointermove', onWinMove)
   window.removeEventListener('pointerup', onWinUp)
   window.removeEventListener('pointercancel', onWinUp)
 })
 
-// 换项目/重新合成后播放头归零
+// 换项目/换集/重新合成后播放头归零（换集时 videoKey 也变，所以这条路也管到了待跳标记之前的状态）
 watch(() => [state.project, videoKey.value], () => {
   cur.value = 0
   duration.value = 0
@@ -373,6 +439,19 @@ watch(() => [state.project, videoKey.value], () => {
   background: #000;
   border-radius: var(--radius-sm);
   border: 1px solid var(--line);
+}
+/* W4 审片屏（全屏）：播放器按视口给高度，时间线加高好拖。
+   写在同一个 scoped 块里、用 `.tabroot.wide` 两级选择器压过上面的基础规则 ——
+   靠父组件 `:deep()` 覆盖会因两边特指度相同而取决于样式顺序，那种"有时生效"不要。 */
+.tabroot.wide .finalvid {
+  max-height: min(58vh, 620px);
+}
+.tabroot.wide .segbar {
+  height: 34px;
+}
+.tabroot.wide .segpreview {
+  bottom: 42px;
+  width: 380px;
 }
 .segwrap {
   margin-top: 10px;

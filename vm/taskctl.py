@@ -44,10 +44,12 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from vm import fsutil
 from types import SimpleNamespace
 from typing import Any
 
@@ -154,14 +156,11 @@ class ModuleNotReady(TaskError):
 
 
 def _atomic_write_json(path: Path, data: Any) -> None:
-    """先写 .tmp 再 os.replace：掉电/被杀不会留下半截 JSON（与 state.py 同策略）。"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    """原子写 JSON。实现已收敛到 `vm/fsutil.py`（唯一真相）。
+
+    保留这个薄壳是为了不动本模块的调用点 —— 收敛的验收标准是"行为逐字节不变"。
+    """
+    fsutil.write_json(path, data, sort_keys=True, trailing_newline=False)
 
 
 def read_json(path: Path, default: Any = None) -> Any:
@@ -1374,12 +1373,8 @@ def _unique_shot_id(existing: Iterable[Any], base: str) -> str:
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "wb") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    """原子写字节。实现已收敛到 `vm/fsutil.py`（补上了原先缺的 `mkdir`）。"""
+    fsutil.write_bytes(path, data)
 
 
 def _retarget_entry_file(entry: Any, src: Path, dst: Path) -> None:
@@ -2033,7 +2028,10 @@ def update_scene(project: str | os.PathLike[str], sid: str, patch: dict,
     if not changed:
         return {"scene": sid, "changed": [], "message": "没有变化"}
     bak = _backup_before_edit(proj, "scenes.json", "编辑场景前")
-    P.save_scenes(proj, list(scenes.values()))
+    # 带上原有的 id 高水位：`next_id` 只按现存卡片重算的话，
+    # 一旦某个高号实体被删过，新场景就会**回收已被镜头引用过的 id**。
+    P.save_scenes(proj, list(scenes.values()),
+                  next_id=P.registry_next_id(proj, "scenes.json"))
     return {
         "scene": sid, "changed": changed, "backup": bak,
         "message": f"已保存场景 {sid}（改了 {'、'.join(changed)}）",
@@ -2066,7 +2064,8 @@ def update_prop(project: str | os.PathLike[str], pid: str, patch: dict,
     if not changed:
         return {"prop": pid, "changed": [], "message": "没有变化"}
     bak = _backup_before_edit(proj, "props.json", "编辑道具前")
-    P.save_props(proj, list(props.values()))
+    P.save_props(proj, list(props.values()),
+                 next_id=P.registry_next_id(proj, "props.json"))
     return {
         "prop": pid, "changed": changed, "backup": bak,
         "message": f"已保存道具 {pid}（改了 {'、'.join(changed)}）",
@@ -2278,7 +2277,11 @@ def episodes(proj) -> list[dict]:
             "size": st.st_size,
             "mtime": int(st.st_mtime),
             "srt": srt.name if srt.is_file() else "",
-            "url": f"/view?project={Path(proj.root).name}&kind=final&file={f.name}",
+            # 2026-09-28 修：地址形态必须与 /view 现在认的一致（final=1&episode=EP01）。
+            # 旧形态 kind=final&file=EP01.mp4 在新 /view 里会 **400** —— 谁信这个字段谁踩坑，
+            # 而且只有点"播放/下载"那一刻才发现。project 名含中文，一律 quote。
+            "url": (f"/view?project={urllib.parse.quote(Path(proj.root).name)}"
+                    f"&final=1&episode={urllib.parse.quote(f.stem)}"),
         })
     return out
 
@@ -2353,7 +2356,7 @@ def props_table(project: str | os.PathLike[str], root: Path | None = None) -> di
         x["shot_count"] = counts.get(str(x.get("id")), 0)
     return {
         "project": str(pdir.name),
-        "props": out,
+        "props": _stamp_chapters(out),
         "assigned": sum(counts.values()),
         "total_shots": len(rows) if isinstance(rows, list) else 0,
         "shots_with_props": sum(1 for r in (rows if isinstance(rows, list) else []) if (r or {}).get("prop_ids")),
@@ -2451,20 +2454,22 @@ def script_table(project: str | os.PathLike[str], root: Path | None = None) -> d
 
 def chapter_table(project: str | os.PathLike[str], root: Path | None = None) -> dict:
     """
-    集/章清单 + 每章状态（多集管理，2026-09-24）。
+    集/章清单 + 每章状态（多集管理）。
 
-    背景：原来 `stage_plan` 写死 `chapters[0]` 并提示"其余章节请分项目或手改镜头表"，
-    也就是**多集从来不支持**。现在改成遍历 novel/ 下全部章节，每章一个镜头表文件
-    （`shots/chapterNN.json`），`load_shots_dir` 按文件名顺序合并，
-    所以逐镜渲染/质检/合成不需要改动就能跑多集。
+    章的顺序与章号**取自 `chapters.json` 清单**（P0.1）。
+    以前这里每次现算 `sorted(novel/*.md)` —— 按 Unicode 码位排中文文件名，
+    实测《第一章/第二章/第三章》排成「一,三,二」，`index` 与从文件名解析的 `no`
+    因此分叉，`--chapter N` 与界面按 `no` 筛出来也不是同一批章。
 
-    **章号从镜头 id 的首段来**（`1-2-03` → 第 1 章），这样即使镜头表被手工改名也对得上。
+    清单不存在时退回 `chapters.list_novel_files()` 的**解析排序**（不再是码位排序），
+    所以没有清单的老项目也立刻是对的；清单会在第一次跑 `plan` 或由界面点"同步"时建立。
+    本函数是只读路径，**不写盘**。
     """
+    from vm import chapters as CH
+
     pdir = resolve_project(project, root)
     proj = Project(pdir)
-    # novel/ 下的章节文件（按文件名排序 = 拆镜顺序）
-    novels = [p for p in sorted(proj.novel_dir.glob("*.md")) + sorted(proj.novel_dir.glob("*.txt"))
-              if not p.name.startswith(".")]
+    targets = CH.plan_targets(proj)
     # shots/ 下的镜头表
     shot_files = [p for p in sorted(proj.shots_dir.glob("*.json"))
                   if not p.name.startswith(".") and not p.name.endswith(".tmp")]
@@ -2480,18 +2485,9 @@ def chapter_table(project: str | os.PathLike[str], root: Path | None = None) -> 
         if seg.isdigit():
             per_ch[seg] = per_ch.get(seg, 0) + 1
 
+    manifest_exists = CH.manifest_path(proj).is_file()
     out: list[dict] = []
-    for i, np_ in enumerate(novels, 1):
-        num = None
-        m = re.search(r"第([零一二两三四五六七八九十\d]+)[章回]", np_.stem)
-        if m:
-            try:
-                num = _cn_num(m.group(1))
-            except Exception:
-                num = None
-        if num is None:
-            num = i
-        key = str(num)
+    for i, (num, np_) in enumerate(targets, 1):
         sf = proj.shots_dir / f"chapter{num:02d}.json"
         out.append({
             "index": i,
@@ -2501,9 +2497,9 @@ def chapter_table(project: str | os.PathLike[str], root: Path | None = None) -> 
             "novel_chars": np_.stat().st_size,
             "shots_file": str(sf) if sf.is_file() else "",
             "has_shots": sf.is_file(),
-            "shots": per_ch.get(key, 0),
+            "shots": per_ch.get(str(num), 0),
         })
-    # 镜头表里出现了但 novel/ 里没有的章（手工加的）
+    # 镜头表里出现了但正文已删的章（手工加过的 / 正文被删掉的）
     known = {str(x["no"]) for x in out}
     for k in sorted(per_ch, key=lambda x: int(x)):
         if k not in known:
@@ -2511,13 +2507,38 @@ def chapter_table(project: str | os.PathLike[str], root: Path | None = None) -> 
                         "novel": "", "novel_chars": 0,
                         "shots_file": str(proj.shots_dir / f"chapter{int(k):02d}.json"),
                         "has_shots": True, "shots": per_ch[k]})
+    stale = [e["no"] for e, (num, path) in zip(out, targets)
+             if (proj.shots_dir / f"chapter{num:02d}.json").is_file()
+             and _chapter_body_changed(proj, path, CH)]
     return {
         "project": str(pdir.name),
         "chapters": out,
         "total_chapters": len(out),
         "total_shots": sum(x["shots"] for x in out),
         "shot_files": [p.name for p in shot_files],
+        "has_manifest": manifest_exists,
+        "conflicts": CH.find_conflicts(proj) if manifest_exists else [],
+        "changed_chapters": stale,
     }
+
+
+def _chapter_body_changed(proj, path: Path, CH) -> bool:
+    """
+    正文在拆过镜之后又被改过吗（P1.5「需重拆」判定的最小版）。
+
+    判定口径是「镜头表比正文旧」而不是「sha 不匹配」—— 因为 sha 记在清单里，
+    而清单只在同步时才刷新；只读路径不能依赖它。
+    """
+    try:
+        body = Path(path)
+        if not body.is_file():
+            return False
+        for f in proj.shots_dir.glob("chapter*.json"):
+            if f.stat().st_mtime < body.stat().st_mtime:
+                return True
+    except OSError:
+        return False
+    return False
 
 
 def _cn_num(s: str) -> int:
@@ -2535,6 +2556,24 @@ def _cn_num(s: str) -> int:
         a, _, b = s.partition("十")
         return d.get(a, 0) * 10 + (d.get(b, 0) if b else 0)
     raise ValueError(s)
+
+
+def _stamp_chapters(rows: list[dict]) -> list[dict]:
+    """
+    给实体表补 `chapters` 字段。
+
+    v1 的 `scenes.json` / `props.json` 里没有这个键 —— 补成空列表并标
+    `chapters_known: False`，含义是 **"不知道它出现在哪些章"**，
+    不是"没在任何章出现过"。界面必须能区分这两件事，
+    否则 P3.1 的实体总表会把所有旧实体显示成"可删"。
+    """
+    for x in rows:
+        if not isinstance(x.get("chapters"), list):
+            x["chapters"] = []
+            x["chapters_known"] = False
+        else:
+            x["chapters_known"] = True
+    return rows
 
 
 def scene_table(project: str | os.PathLike[str], root: Path | None = None) -> dict:
@@ -2569,7 +2608,7 @@ def scene_table(project: str | os.PathLike[str], root: Path | None = None) -> di
         x["shot_count"] = counts.get(str(x.get("id")), 0)
     return {
         "project": str(pdir.name),
-        "scenes": out,
+        "scenes": _stamp_chapters(out),
         "assigned": sum(counts.values()),
         "total_shots": len(rows) if isinstance(rows, list) else 0,
         "file": str(sp),
@@ -3566,7 +3605,15 @@ def rewrite_shot(project, shot_id: str, *, feedback: str = "", root: Path | None
     prev = _neighbor_in_docs(docs, shot_id, -1)
 
     cards = pl.load_char_cards(proj)
-    style = pl._card_style(cards.values()) or getattr(pl, "DEFAULT_STYLE", "")
+    # ★ 风格必须取**整本那份**（style.json）。以前这里是
+    # `角色卡继承 → DEFAULT_STYLE`，而 DEFAULT_STYLE 是写死的"土黄写实"——
+    # 于是用户在 W2 把整本设成 anime 之后，点一记「AI 重写这镜提示词」，
+    # 重写出来的一镜会带着写实风格句，**与同一片其余镜头打架**。
+    # 优先级：整本已确定的 > 角色卡继承的 > 常量兜底。
+    from vm import register as _reg
+    _book_style = str(_reg.resolve(proj)[1] or "").strip()
+    style = (_book_style or pl._card_style(cards.values())
+             or getattr(pl, "DEFAULT_STYLE", ""))
     chars = [str(c) for c in _as_list(item.get("chars"))]
     dd_cur = ""
     try:
@@ -3854,12 +3901,7 @@ def save_char_prompt(project: str | os.PathLike[str], name: str, text: str, root
     proj = Project(resolve_project(project, root))
     proj.prompts_dir.mkdir(parents=True, exist_ok=True)
     f = proj.prompts_dir / f"char_{name}.txt"
-    tmp = f.with_suffix(".txt.tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(text if text is not None else "")
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, f)
+    fsutil.write_text(f, text if text is not None else "")
     prompt = char_prompt(project, name, root)
     return {"name": name, "path": str(f), "prompt": prompt, "prompt_warnings": char_prompt_warnings(prompt)}
 
@@ -4059,11 +4101,17 @@ def _build_cmd(
     dry: bool,
     fake_sleep: float,
     count: int = 0,
+    chapter: str | int | None = None,
 ) -> list[str]:
     # -u：worker 的 stdout 是管道，不加 -u 会块缓冲，"实时日志"就变成"结束才刷一堆"
     cmd = [sys.executable, "-u", str(PIPELINE), project, "--stage", stage, "--_worker"]
     if only:
         cmd += ["--only", ",".join(only)]
+    # ★ P0.3：`--chapter` 原先在 pipeline 里定义了、worker 也认，但这里从不拼 ——
+    # 于是 CLI 与 Web 两条路**都到不了** worker，"只拆第 N 章"是死参数，
+    # 改一章正文要把全部章节重跑一遍 LLM。
+    if chapter not in (None, "", 0):
+        cmd += ["--chapter", str(chapter)]
     if count:
         cmd += ["--count", str(int(count))]
     if force:
@@ -4084,6 +4132,7 @@ def start_async(
     dry: bool = False,
     fake_sleep: float = 0.0,
     count: int = 0,
+    chapter: str | int | None = None,
     root: Path | None = None,
     echo: bool = False,
 ) -> TaskHandle:
@@ -4143,6 +4192,7 @@ def start_async(
             "finished_at": None,
             "exit_code": None,
             "only": list(only or []),
+            "chapter": str(chapter) if chapter not in (None, "", 0) else "",
             "count": int(count or 0),
             "force": bool(force),
             "dry": bool(dry),
@@ -4150,7 +4200,7 @@ def start_async(
             "error": "",
         }
         cmd = _build_cmd(pdir.name, stage, only=only, force=force, dry=dry,
-                         fake_sleep=fake_sleep, count=count)
+                         fake_sleep=fake_sleep, count=count, chapter=chapter)
         env = dict(os.environ)
         env["PYTHONUNBUFFERED"] = "1"
         env["VM_TASK_MODE"] = "1"
@@ -4168,7 +4218,7 @@ def start_async(
         logf = open(lp, "a", encoding="utf-8", buffering=1)
         try:
             logf.write(f"\n===== 任务开始 {time.strftime('%Y-%m-%d %H:%M:%S')} stage={stage} "
-                       f"only={only or '-'} force={force} dry={dry} =====\n")
+                       f"only={only or '-'} chapter={chapter or '-'} force={force} dry={dry} =====\n")
             logf.flush()
             proc = subprocess.Popen(
                 cmd,
@@ -4204,12 +4254,13 @@ def run_foreground(
     dry: bool = False,
     fake_sleep: float = 0.0,
     count: int = 0,
+    chapter: str | int | None = None,
     root: Path | None = None,
 ) -> int:
     """CLI 路径：派生同一个 worker，然后前台等待并转发信号。"""
     handle = start_async(
         project, stage, only=only, force=force, dry=dry, fake_sleep=fake_sleep,
-        count=count, root=root, echo=True,
+        count=count, chapter=chapter, root=root, echo=True,
     )
     print(f"[taskctl] 任务已启动：pid={handle.pid} stage={stage} 日志={log_path(handle.pdir)}", flush=True)
     print("[taskctl] 停止：Ctrl-C，或 Web UI 的「停止」按钮", flush=True)

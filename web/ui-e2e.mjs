@@ -91,6 +91,14 @@ async function switchTab(label) {
   await page.waitForTimeout(1200)
 }
 
+// 工作区切换（F1.1 hash 路由）。用 location.hash 而不是点顶栏按钮：
+// 顶栏被 .uitools 浮层遮过（同 switchTab 用 evaluate 的理由），而"路由本身能走通"
+// 已经由 ws-tab-* 那条断言单独覆盖，这里只关心切完之后那一屏的内容。
+async function goWs(path) {
+  await page.evaluate((p) => { window.location.hash = p }, path)
+  await page.waitForTimeout(1100)
+}
+
 // tap：先正常点击，被浮动层（.uitools 等）盖住热区时退化为对元素派发 click。
 // 只救「浮层下的按钮」，断言照旧严格（验的是点击后的 API 行为契约）。
 // 「详情弹层」判定：只认含六段式/台词编辑的**镜头弹层**（残留的预算/确认弹窗不算）
@@ -144,6 +152,27 @@ await page.goto(BASE, { waitUntil: 'networkidle', timeout: 60000 })
 // 等首批数据落地（镜头表出现行）
 await page.waitForSelector('table.shots tbody tr', { timeout: 30000 }).catch(() => {})
 mark('① 打开页面 + 首批数据')
+
+// ---------- 夹具总闸：先确认"我们真的在夹具服务器上" ----------
+// 不写死端口就得靠这条兜底：漏了 VM_BASE 会连到 8801 那个**真实数据**的服务，
+// 那边没有 e2efx → /api/shots 回 200 + 空表（后端对未知项目一直是这个形状），
+// 于是"6 镜"的断言全红、而"0+0+0 === 0"这类互证断言反而**空过**（实测踩过）。
+{
+  const gate = await page.evaluate(async (fx) => {
+    const r = await fetch('/api/shots?project=' + encodeURIComponent(fx))
+    const d = await r.json()
+    return { total: d?.counts?.total ?? -1, origin: window.location.origin }
+  }, FIXTURE)
+  if (gate.total !== FX_TOTAL) {
+    console.error(`\n❌ 目标服务器不是夹具（${gate.origin} 上 ${FIXTURE} 有 ${gate.total} 镜，应为 ${FX_TOTAL}）`)
+    console.error('   正确跑法：python3 -m vm.tests.e2e_fixture --serve --port 8899')
+    console.error('             VM_BASE=http://127.0.0.1:8899 node ui-e2e.mjs')
+    await page.screenshot({ path: '/tmp/vue-no-fixture.png' }).catch(() => {})
+    await browser.close()
+    process.exit(2)
+  }
+  chk('⓪′ 夹具总闸：目标服务器确实挂着合成夹具', true, `${gate.origin} / ${FX_TOTAL} 镜`)
+}
 
 // ---------- ⓪ 挂载总闸（一切断言之前）----------
 // 构建绿 ≠ 能用：T5 期间出过「vite build 通过但启动即白屏」（App.vue 引用未定义的
@@ -253,20 +282,28 @@ chk('胶片条项数 = 镜头数', fsCount === FX_TOTAL, `${fsCount}`)
 // ---------- ⑤ 右栏 tab ----------
 const tabs = await page.locator('.el-tabs__item, [role=tab]').allInnerTexts()
 const tabText = tabs.join('|')
-chk('右栏 tab 含 7 个（日志/角色/场景/道具/质检/审计/成片）',
-  ['日志', '角色', '场景', '道具', '质检', '审计', '成片'].every((t) => tabText.includes(t)), tabText)
+// F3.1 收敛：9 → 7。断言写「正好 7 个 + 名单」，不用 every(includes) ——
+// 以前那条写着"含 7 个"却只 check 7 个标签是否**出现**，实际 9 个照样通过（假断言）。
+chk('右栏正好 7 个 tab（场景与道具合并、成片搬去 W4）',
+  tabs.length === 7
+  && ['日志', '角色定妆', '剧本', '场景与道具', '分镜图', '质检', '审计']
+    .every((t) => tabText.includes(t)), `${tabs.length} 个：${tabText}`)
+chk('★ 成片 tab 已不在右栏（避免与 W4 各留一份缩小副本）', !tabText.includes('成片'), tabText)
 
-// 场景 tab（锚点：山门/古井 + 一致性锚定的说明文案）
-await switchTab('场景')
-const sceneTxt = await page.locator('#app').innerText()
-chk('★ 场景 tab 显示 2 个场景（山门/古井）',
-  ['山门', '古井'].every((s) => sceneTxt.includes(s)))
-chk('★ 场景 tab 说明锚定是「逐字注入」+ 跨镜一致性', /逐字注入|一致性锚点/.test(sceneTxt))
-
-// 道具 tab（锚点：禅杖/念珠）
-await switchTab('道具')
-const propTxt = await page.locator('#app').innerText()
-chk('道具 tab 显示 2 个道具（禅杖/念珠）', ['禅杖', '念珠'].every((s) => propTxt.includes(s)))
+// 场景与道具（合并 tab；锚点：山门/古井 + 禅杖/念珠 **同屏**可见）
+await switchTab('场景与道具')
+const spTxt = await page.locator('#app').innerText()
+chk('★ 合并 tab 一个屏里同时列出 2 个场景（山门/古井）',
+  ['山门', '古井'].every((s) => spTxt.includes(s)))
+chk('★ 合并 tab 一个屏里同时列出 2 个道具（禅杖/念珠）',
+  ['禅杖', '念珠'].every((s) => spTxt.includes(s)))
+chk('★ 场景锚定说明仍是「逐字注入」+ 跨镜一致性', /逐字注入|一致性锚点/.test(spTxt))
+chk('★ 两段各有段标题（不是把两份清单裸接在一起）',
+  (await page.locator('[data-testid=scene-list]').count()) === 1
+  && (await page.locator('[data-testid=prop-list]').count()) === 1)
+chk('★ 合并后汇总行同时给出场景与道具的归属镜数',
+  /场景.*镜/.test(spTxt) && /道具.*镜/.test(spTxt),
+  spTxt.split('\n').find((l) => /场景.*道具/.test(l)) || '')
 
 mark('③ 胶片条 完成')
 // 剧本 tab（夹具剧本由 build_from_shots 真实推导，逐字校验 gate_passed）
@@ -336,11 +373,21 @@ chk('审计显示 ambiguous-speaker 的镜头 id', auditTxt.includes('1-1-02'))
 chk('审计把全片级 finding 单独标出', /全片|项目级/.test(auditTxt))
 
 mark('⑥ 质检 + B3 完成')
-// 成片 tab + 分段播放器（EP01/EP02 多集；段数与所选集的镜数一致）
-await switchTab('成片')
-const segCount = await page.locator('.seg').count()
-chk('成片分段数 = 镜头数（单集视角取一集的镜数）',
-  segCount === FX_TOTAL || segCount === FX_CH1, `${segCount}`)
+// W4 审片屏 + 分段播放器（一集一章：EPnn = 第 nn 章的镜）。
+// 播放器已从右栏 tab 搬到这里（F3.1），所以这段先切屏再测。
+await goWs('/review')
+let segCount = await page.locator('.seg').count()
+// ★ 这条是 F3 修出来的：以前播 EP02（2 镜）也画全片 6 段，
+//   段宽、点段跳转、播放头高亮三处一起偏（420px 右栏里看不出来，全屏才暴露）。
+chk('★ 分段条只画所选那一集的镜（默认最新集 EP02 = 2 镜，不是全片 6 镜）',
+  segCount === FX_CH2, `${segCount} 段`)
+const epBtns = page.locator('.epbtn')
+if ((await epBtns.count()) > 1) {
+  await epBtns.first().click({ force: true }) // → EP01
+  await page.waitForTimeout(1000)
+  segCount = await page.locator('.seg').count()
+  chk('★ 切集后分段条跟着重画（EP01 = 该章 4 镜）', segCount === FX_CH1, `${segCount} 段`)
+}
 if (segCount) {
   const flexSum = await page.locator('.seg').evaluateAll((els) =>
     els.reduce((a, e) => a + (parseFloat(getComputedStyle(e).flexGrow) || 0), 0))
@@ -352,6 +399,7 @@ if (segCount) {
   })
   chk('段底色区分质检结果（多色）', colors.length >= 2, colors.join(' '))
 }
+await goWs('/workbench')
 
 mark('⑦ 成片 完成')
 // ---------- ⑥ 详情弹层 ----------
@@ -653,8 +701,15 @@ mark("⑩ 多章 完成")
   }
 
   // ⑨ 成片时间线（task-3）—— hover 预览卡 / 详情按钮 / 点段不弹层 / scrub
-  await page.locator('.el-tabs__item, [role=tab]').filter({ hasText: '成片' }).first().click({ force: true })
-  await page.waitForTimeout(1000)
+  // 播放器现在只在 W4 审片屏（右栏那份副本已撤），所以整段在 /review 上跑。
+  // 「详情按钮」这一条顺带多验了一件事：镜头弹层必须从**别的屏**也能弹出
+  // （el-dialog 是 append-to-body 的，WorkbenchView 被 KeepAlive 摘下来时它仍然有效）。
+  await goWs('/review')
+  // 一集一章之后默认集只有 2 段，而 hover/详情/点段这几条要 4 段才测得动 → 先切到 EP01
+  if ((await page.locator('.epbtn').count()) > 1) {
+    await page.locator('.epbtn').first().click({ force: true })
+    await page.waitForTimeout(1000)
+  }
   const seg0 = page.locator('[data-testid=timeline-seg]')
   const segN = await seg0.count()
   chk('★ 时间线分段带稳定定位（timeline-seg）', segN > 0, `${segN} 段`)
@@ -715,7 +770,9 @@ mark("⑩ 多章 完成")
   } else {
     skip('时间线 scrub（U8）', '[data-testid=timeline-scrub] 未渲染或分段不足')
   }
-  // 「点段/scrub = 联动选中」的落点：切回剧本看高亮
+  // 「点段/scrub = 联动选中」的落点：切回工作台剧本 tab 看高亮
+  // （跨屏仍要成立：审片屏上拖出来的选中，回到镜头表/剧本那边得还是同一镜）
+  await goWs('/workbench')
   await page.locator('.el-tabs__item, [role=tab]').filter({ hasText: '剧本' }).first().click({ force: true })
   await page.waitForTimeout(600)
   const mark2 = await findSelectionMarker('.sl')
@@ -839,6 +896,427 @@ mark("⑩ 多章 完成")
       && rep.bulk.j.skipped.includes('2-1-02') && rep.bulk.j.updated.includes('1-1-01'),
       `bulk → ${rep.bulk.status} ${JSON.stringify(rep.bulk.j).slice(0, 140)}`)
     await ep2.close()
+  }
+
+  // ⑮ 单一心跳闸（F0.2）：全控制台只允许 1 个 setInterval。
+  // 拆之前是 3 个（App 2s 主轮询 / QueueFab 1s 时钟 / QueueFab 3s 队列），
+  // 各自 clearInterval、节拍互相撞、切到后台照跑。这里同时验"合并了但节拍没乱"：
+  // status 仍约 2s 一次、queue 仍约 3s 一次。独立页面 + addInitScript 必须在导航前挂。
+  {
+    const tp = await browser.newPage()
+    await tp.addInitScript(() => {
+      window.__si = 0
+      const orig = window.setInterval.bind(window)
+      window.setInterval = (fn, ms, ...rest) => { window.__si++; return orig(fn, ms, ...rest) }
+    })
+    await tp.goto(BASE, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {})
+    await tp.waitForTimeout(3000)
+    const created = await tp.evaluate(() => window.__si)
+    const counted = await tp.evaluate(() => new Promise((res) => {
+      const m = {}
+      const ro = new PerformanceObserver((l) => {
+        for (const e of l.getEntries()) {
+          const p = (e.name.match(/\/api\/[a-z]+/) || [''])[0]
+          if (p) m[p] = (m[p] || 0) + 1
+        }
+      })
+      ro.observe({ entryTypes: ['resource'] })
+      setTimeout(() => { ro.disconnect(); res(m) }, 6000)
+    }))
+    chk('★ 全控制台只有一个 setInterval（F0.2 单心跳）', created === 1, `创建了 ${created} 个`)
+    chk('★ 合并到单心跳后节拍不变（status≈2s、queue≈3s）',
+      (counted['/api/status'] || 0) >= 2 && (counted['/api/queue'] || 0) >= 1,
+      `6s 内 ${JSON.stringify(counted)}`)
+    await tp.close()
+  }
+}
+
+// ---------- ⑨'' P1 新能力：项目与章节管理（W0/W1）----------
+// 这块是**新界面**，不用真浏览器点一遍就等于没测。
+// 纪律：在被测项目名里带时间戳 + 结束后 rm 掉该目录 ——
+// 后台的 create_project 刻意「拒绝覆盖同名项目」（防静默清空别人的片子），
+// 所以固定名字的用例第二次跑必红；夹具根是 tmp，删自己造的东西是安全的。
+{
+  const P1_NAME = `e2ep1-${Date.now()}`
+  const { rmSync } = await import('node:fs')
+  // 临时文件路径声明在 try **外面**：finally 要用，声明在里面是块级作用域，
+  // 上一版就是这么写成了 `f1CleanPath is not defined`（自己踩的）。
+  const tmpFiles = ['/tmp/e2ep1_a.md', '/tmp/e2ep1_b.md']
+  const [f1, f2] = tmpFiles
+  try {
+    await page.goto(BASE + '/#/projects', { waitUntil: 'domcontentloaded' })
+    await page.waitForTimeout(700)
+    // 切换器就是流程本身：编号 + 名字一起断，比"有几个 a 标签"更能说明问题
+    // （W4 加第 5 屏时，纯计数那条只会红、不会告诉你哪一屏跑偏了）
+    const wsLabels = (await page.locator('[data-testid=ws-nav] a').allInnerTexts())
+      .map((t) => t.replace(/\s+/g, ''))
+    chk('★P1 工作区切换器 = 流程五屏（0 项目 → 1 章节 → 2 风格 → 3 镜头 → 4 成片）',
+      wsLabels.join('>') === '0项目>1章节>2风格>3镜头>4成片', wsLabels.join(' | '))
+    // W2 已在 P2 实施，所以这里断言"它已可用"（原先断言的是禁用态 —— 事实变了，
+    // 断言跟着改，而不是留着让测试长红）
+    chk('★P1 「风格」屏已实施、可点（不再禁用）',
+      await page.locator('[data-testid=ws-tab-style]').getAttribute('aria-disabled') === null)
+    chk('★P1 项目屏可达', (await page.locator('[data-testid=ws-projects]').count()) === 1)
+
+    // 新建向导
+    await page.locator('[data-testid=btn-new-project]').click()
+    await page.waitForSelector('[data-testid=new-project-mask]')
+    await page.locator('[data-testid=np-name]').fill(P1_NAME)
+    await page.locator('[data-testid=np-title]').fill('E2E 用项目')
+    await page.locator('[data-testid=np-logline]').fill('自动化造的壳')
+    await page.waitForTimeout(120)
+    await page.locator('[data-testid=np-submit]').click()
+    await page.waitForTimeout(900)
+    chk('★P1 新建项目后自动落到章节屏', !!page.url().includes('/chapters'), page.url())
+
+    // 手动新建一章（粘贴正文）
+    await page.locator('[data-testid=btn-ch-new]').click()
+    await page.waitForTimeout(250)
+    await page.locator('[data-testid=ch-title]').fill('第一章_开局')
+    await page.locator('[data-testid=ch-body]').fill('主角在站台出现。' .repeat(40))
+    await page.waitForTimeout(120)
+    chk('★P1 未保存徽标出现', (await page.locator('[data-testid=ch-dirty]').count()) === 1)
+    await page.locator('[data-testid=ch-save]').click()
+    await page.waitForTimeout(900)
+    chk('★P1 保存后清单出现该章且标「未拆」',
+      (await page.locator('[data-testid=ch-row]').count()) === 1
+      && (await page.locator('[data-testid=badge-todo]').count()) === 1)
+
+    // 导入两个文件（第二个是同名，应被跳过不覆盖）
+    writeFileSync(f1, '第二章内容。'.repeat(60))
+    writeFileSync(f2, '第三章内容。'.repeat(60))
+    await page.locator('[data-testid=btn-ch-import]').click()
+    await page.waitForSelector('[data-testid=import-mask]')
+    await page.locator('[data-testid=import-input]').setInputFiles([f1, f2])
+    await page.waitForTimeout(400)
+    chk('★P1 导入对话框列出 2 个文件', (await page.locator('[data-testid=import-picked] li').count()) === 2)
+    await page.locator('[data-testid=import-submit]').click()
+    await page.waitForTimeout(1100)
+    chk('★P1 导入后共 3 章', (await page.locator('[data-testid=ch-row]').count()) === 3,
+      String(await page.locator('[data-testid=ch-row]').count()))
+
+    // 改正文 → 该章应被标「需重拆」（前提是它已拆过；这里没拆，所以只验"保存成功且不脏"）
+    await page.locator('[data-testid=ch-row]').first().click()
+    await page.waitForTimeout(500)
+    await page.locator('[data-testid=ch-body]').type('补一句。', { delay: 5 })
+    await page.waitForTimeout(150)
+    chk('★P1 编辑既有章节会出现未保存态', (await page.locator('[data-testid=ch-dirty]').count()) === 1)
+    await page.locator('[data-testid=ch-revert]').click()
+    await page.waitForTimeout(250)
+    chk('★P1 放弃修改后回到干净态', (await page.locator('[data-testid=ch-dirty]').count()) === 0)
+
+    // 重排：第二章上移一次
+    const before = await page.locator('[data-testid=ch-row] .main b').allInnerTexts()
+    await page.locator('[data-testid=ch-down]').first().click()
+    await page.waitForTimeout(1000)
+    const after = await page.locator('[data-testid=ch-row] .main b').allInnerTexts()
+    chk('★P1 上移/下移真的改变清单顺序', before.join() !== after.join(),
+      `${before.join('、')} → ${after.join('、')}`)
+    chk('★P1 首行上移按钮禁用（不能越界）',
+      await page.locator('[data-testid=ch-up]').first().isDisabled())
+
+    // 删除是可逆的：进 _trash
+    await page.locator('[data-testid=ch-delete]').first().click()
+    await page.waitForTimeout(300)
+    await confirmIfAsked()
+    await page.waitForTimeout(1100)
+    chk('★P1 删除后清单少一章', (await page.locator('[data-testid=ch-row]').count()) === 2,
+      String(await page.locator('[data-testid=ch-row]').count()))
+    const trash = await page.evaluate(async (nm) => {
+      const r = await fetch('/api/chapter/trash?project=' + encodeURIComponent(nm))
+      return r.json()
+    }, P1_NAME)
+    chk('★P1 被删正文确实在 _trash 里（可恢复，不是真删）',
+      Array.isArray(trash.items) && trash.items.length >= 1, trash.message)
+
+    // 回到工作台不该炸（新项目 0 镜头）
+    await page.locator('[data-testid=ws-tab-workbench]').click()
+    await page.waitForTimeout(1200)
+    chk('★P1 零镜头项目的工作台不报错（空态而不是白屏）',
+      (await page.locator('.workbench').count()) === 1)
+  } catch (e) {
+    chk('★P1 项目与章节管理（整段）', false, String(e).slice(0, 160))
+  } finally {
+    // 自己造的沙箱自己清干净：临时项目目录 + 两个临时 md
+    rmSync(`/tmp/vm-e2e/${P1_NAME}`, { recursive: true, force: true })
+    for (const f of tmpFiles) rmSync(f, { force: true })
+  }
+}
+
+  // 「只重拆这一章」：前端有没有把 chapter 号真的发出去。
+  // P0.3 修好了后台，但**界面没有入口 = 修了等于没修**，所以这条必须测。
+  // 用 route 桩：① 不真起任务（不烧 token）；② 不依赖夹具里是否存在"正文比镜头表新"
+  // 这种时间戳巧合 —— 那种断言换台机器就会漂。
+  {
+    const cap = { run: null }
+    const rp = await browser.newPage({ viewport: { width: 1680, height: 1000 } })
+    await rp.route('**/api/chapters**', async (route) => {
+      const r = await route.fetch()
+      const j = await r.json()
+      if (j.chapters?.length) j.chapters[0].needs_replan = true
+      await route.fulfill({ response: r, body: JSON.stringify(j) })
+    })
+    await rp.route('**/api/run', async (route) => {
+      cap.run = JSON.parse(route.request().postData() || '{}')
+      await route.fulfill({ status: 200, contentType: 'application/json',
+        body: JSON.stringify({ ok: true, message: 'stubbed', pid: 1, stage: 'plan' }) })
+    })
+    await rp.goto(BASE + '/#/chapters', { waitUntil: 'domcontentloaded' })
+    await rp.waitForTimeout(900)
+    chk('★P1 需重拆的章节出现「只重拆这一章」按钮',
+      (await rp.locator('[data-testid=ch-replan]').count()) === 1)
+    chk('★P1 该章同时挂「需重拆」徽标',
+      (await rp.locator('[data-testid=badge-replan]').count()) === 1)
+    await rp.locator('[data-testid=ch-replan]').click()
+    await rp.waitForTimeout(350)
+    // 必须弹确认：拆镜烧 token，静默触发是本项目明令避免的
+    const asked = (await rp.locator('.el-message-box, .el-overlay-dialog').count()) > 0
+    chk('★P1 单章重拆要先确认（不静默烧 token）', asked)
+    // `confirmIfAsked()` 内部硬编码用主页面 `page`，对第二个页面对象无效，
+    // 所以这里就地确认（不要为了省事把 helper 改成"接受一个 page 参数"却仍指向主页面）。
+    const rbox = rp.locator('.el-message-box, .el-overlay-dialog')
+    if ((await rbox.count()) > 0) {
+      const btns = rbox.locator('button')
+      const n = await btns.count()
+      for (let i = n - 1; i >= 0; i--) {
+        const t = (await btns.nth(i).innerText()).trim()
+        if (t && !/取消|Close|关闭/.test(t)) { await btns.nth(i).click(); break }
+      }
+    }
+    await rp.waitForTimeout(700)
+    const no = cap.run?.chapter
+    chk('★P1 /api/run 带 chapter 号（真的只拆那一章）',
+      cap.run?.stage === 'plan' && typeof no === 'number' && no > 0,
+      JSON.stringify(cap.run))
+    chk('★P1 不默认 force（保留护栏）', cap.run ? cap.run.force !== true : false,
+      JSON.stringify(cap.run))
+    await rp.close()
+  }
+
+// ---------- ⑨‴ P2 风格层（W2）----------
+// P2 的实质不是"多了个下拉框"，而是两件事：风格变成整本一份 + 改风格的代价在保存前就摊开。
+//
+// ★ 纪律：本段自己准备起点、自己收尾。上一版栽过 —— 夹具风格被之前手工 curl 设成
+//   anime，于是"点 anime 卡片"不产生脏态、保存按钮始终禁用、测试点 30s 超时。
+//   依赖上一次运行留下的状态 = 必然出现"只红一次"的测试。
+{
+  const sp = await browser.newPage({ viewport: { width: 1680, height: 1000 } })
+  const posts = []
+  sp.on('request', (r) => {
+    if (r.method() === 'POST' && /\/api\/style/.test(r.url())) {
+      posts.push({ u: r.url().split('/api/')[1], b: JSON.parse(r.postData() || '{}') })
+    }
+  })
+  try {
+    await sp.goto(BASE, { waitUntil: 'domcontentloaded' })
+    await sp.evaluate(async () => {
+      await fetch('/api/style/set', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project: 'e2efx', preset: 'realistic' }) })
+    })
+    await sp.goto(BASE + '/#/style', { waitUntil: 'domcontentloaded' })
+    await sp.waitForTimeout(900)
+
+    chk('★P2 风格屏可达', (await sp.locator('[data-testid=ws-style]').count()) === 1)
+    chk('★P2 三个预设卡片都在', (await sp.locator('[data-testid=st-presets] button').count()) === 3)
+    const src0 = (await sp.locator('[data-testid=st-source]').innerText()).replace(/\n/g, ' ')
+    chk('★P2 显示风格出处（不是匿名下拉框）',
+      /人工设定|系统按整本推荐|预设默认/.test(src0), src0.slice(0, 50))
+    chk('★P2 影响清单在保存前就已显示', (await sp.locator('[data-testid=st-impact]').count()) === 1)
+    const imp = (await sp.locator('[data-testid=st-impact]').innerText()).replace(/\s+/g, ' ')
+    chk('★P2 影响清单如实说明"改风格不会让镜头自动 stale"',
+      /不会.*让镜头自动变 stale/.test(imp), imp.slice(0, 90))
+    chk('★P2 无从判断的图被单列，而不是算成"无需重出"',
+      /无从判断/.test(imp) || (await sp.locator('[data-testid=st-untracked]').count()) === 0,
+      imp.slice(0, 60))
+
+    const curPreset = (src0.match(/当前：\s*(\w+)/) || [])[1] || 'realistic'
+    const target = ['cg', 'anime', 'realistic'].find((k) => k !== curPreset)
+    await sp.locator(`[data-testid=st-preset-${target}]`).click()
+    await sp.waitForTimeout(800)
+    chk(`★P2 切到 ${target} 后进入未保存态（保存可点）`,
+      await sp.locator('[data-testid=st-save]').isEnabled())
+
+    await sp.locator('[data-testid=st-save]').click()
+    await sp.waitForTimeout(700)
+    const box = sp.locator('.el-message-box')
+    if ((await box.count()) > 0) {
+      const txt = (await box.innerText()).replace(/\s+/g, ' ')
+      chk('★P2 保存前确认框讲清"只改设定、不重写镜头表"',
+        /不会.*重写镜头表|重跑.*拆镜/.test(txt), txt.slice(0, 80))
+      const btns = box.locator('button')
+      await btns.nth((await btns.count()) - 1).click()
+      await sp.waitForTimeout(1000)
+    } else {
+      chk('★P2 无旧风格句时不弹多余确认', true)
+    }
+    const after = (await sp.locator('[data-testid=st-source]').innerText()).replace(/\n/g, ' ')
+    chk(`★P2 保存后落到 ${target} 且标记"已人工确认"`,
+      after.includes(target) && /已人工确认/.test(after), after.slice(0, 60))
+    chk('★P2 保存走 /api/style/set', posts.some((x) => x.u.startsWith('style/set')),
+      JSON.stringify(posts.map((x) => x.u)))
+  } catch (e) {
+    chk('★P2 风格屏（整段）', false, String(e).slice(0, 180))
+  } finally {
+    await sp.close()
+    const { rmSync } = await import('node:fs')
+    rmSync('/tmp/vm-e2e/e2efx/style.json', { force: true })
+  }
+}
+
+// ---------- ⑨‖ P3 实体总表（W2 下半）----------
+// 这页的价值是"救济"：跨章去重一定会判错，必须有一个能看见、能手工纠正的入口。
+// 用 route 桩喂 /api/entities，避免真合并把夹具镜头表改坏（真合并的路径已有后端单测覆盖）。
+{
+  const ep3 = await browser.newPage({ viewport: { width: 1680, height: 1000 } })
+  try {
+    await ep3.route('**/api/entities?**', async (route) => {
+      await route.fulfill({ contentType: 'application/json', body: JSON.stringify({
+        ok: true, project: 'e2efx',
+        entities: [
+          { kind: 'char', id: '唐僧', name: '唐僧', chapters: [1, 2], shot_count: 3,
+            has_prompt: true, portrait_variants: [{ path: 'char_唐僧.png', chapter: null, kind: 'default' }],
+            portrait_chapters: [], costume_variants: ['default', 'wet_robe'] },
+          { kind: 'scene', id: 'S1', name: '山门', chapters: [1], shot_count: 3, location: 'gate', time_of_day: 'dusk' },
+          { kind: 'scene', id: 'S9', name: '山门', chapters: [], shot_count: 0, location: 'gate' },
+          { kind: 'prop', id: 'P1', name: '禅杖', chapters: [1], shot_count: 2, owner: '唐僧', inferred: true },
+        ],
+        totals: { char: 1, scene: 2, prop: 1 },
+        suspect_merges: ['场景名「山门」被登记在多个 id 上（S1, S9）—— 若是同一个地点，请手工合并'],
+        never_used: ['scene:S9'],
+      }) })
+    })
+    await ep3.goto(BASE + '/#/style', { waitUntil: 'domcontentloaded' })
+    await ep3.waitForTimeout(1100)
+    chk('★P3 实体总表随 W2 一起渲染', (await ep3.locator('[data-testid=entities-panel]').count()) === 1)
+    chk('★P3 四类实体分行列出', (await ep3.locator('[data-testid=ent-table] tbody tr').count()) === 4)
+    chk('★P3 去重可疑被显式暴露（不是静默合并）',
+      (await ep3.locator('[data-testid=ent-suspect]').count()) === 1
+      && /山门/.test(await ep3.locator('[data-testid=ent-suspect]').innerText()))
+    chk('★P3 零引用实体被点名', /S9/.test(await ep3.locator('[data-testid=ent-unused]').innerText()))
+    chk('★P3 章数从镜头反推显示', /1、2/.test(await ep3.locator('[data-testid=ent-row-char-唐僧]').innerText()))
+    chk('★P3 推断道具带「推断」标记（需人工复核）',
+      /推断/.test(await ep3.locator('[data-testid=ent-row-prop-P1]').innerText()))
+    chk('★P3 场景行给出合并入口', (await ep3.locator('[data-testid=ent-merge]').count()) === 2)
+    const btn = ep3.locator('[data-testid=ent-portrait-唐僧]')
+    chk('★P3 有服装变体的角色才能按章出专属定妆', await btn.isEnabled())
+    chk('★P3 按章筛选下拉可用', (await ep3.locator('[data-testid=ent-chapter-filter]').count()) === 1)
+    await ep3.locator('[data-testid=ent-chapter-filter]').selectOption('2')
+    await ep3.waitForTimeout(400)
+    chk('★P3 按章筛选真的过滤了行', (await ep3.locator('[data-testid=ent-table] tbody tr').count()) === 1)
+  } catch (e) {
+    chk('★P3 实体总表（整段）', false, String(e).slice(0, 180))
+  } finally {
+    await ep3.close()
+  }
+}
+
+// ---------- ⑨″ W4 审片屏（F3.1 的落点：播放器与问题清单同屏）----------
+{
+  const rv = await browser.newPage({ viewport: { width: 1680, height: 1000 } })
+  const rvErrs = []
+  rv.on('pageerror', (e) => rvErrs.push(String(e.message)))
+  rv.on('console', (m) => { if (m.type() === 'error' && !/409|favicon/.test(m.text())) rvErrs.push(m.text()) })
+  try {
+    // 先走**用户真正会走的路**：落在工作台 → 顶点栏「成片」。
+    await rv.goto(BASE, { waitUntil: 'domcontentloaded' })
+    await rv.waitForTimeout(2000)
+    await rv.locator('[data-testid=ws-tab-review]').click({ force: true })
+    await rv.waitForTimeout(1400)
+
+    chk('★W4 顶栏「成片」可点，点得到这一屏（工作区 5 屏名单由 P1 那条管）',
+      (await rv.locator('[data-testid=ws-review]').count()) === 1
+      && (await rv.locator('[data-testid=ws-tab-review].on').count()) === 1)
+
+    // 再冷启动直接进 #/review 并刷新一次：这一条专抓
+    // "子组件 onMounted 早于 loadProjects 落地" → 清单永远空（实测踩过，靠 watch state.project 修）
+    await rv.reload({ waitUntil: 'domcontentloaded' })
+    await rv.waitForTimeout(2600)
+    chk('★W4 冷启动直链可达（不必先从工作台点进来）',
+      (await rv.locator('[data-testid=ws-review]').count()) === 1)
+    const coldRows = await rv.locator('[data-testid=rv-findings] .qcrow:not(.project)').count()
+    chk('★W4 冷启动时两张清单真的拉到数据（不是等项目落地的那次空拉）',
+      coldRows > 0, `${coldRows} 行`)
+    // 完备性矩阵由 AuditTab 自己拉（`refreshCompleteness`）。截图时它还是"加载中…"，
+    // 所以这条要**等到它真出来**才算数 —— 否则新屏上少一个数据源没人发现。
+    await rv.waitForSelector('.cmtable', { timeout: 15000 }).catch(() => {})
+    chk('★W4 完备性矩阵在审片屏也出得来（不是只在工作台那个 tab 里才加载）',
+      (await rv.locator('.cmtable').count()) === 1)
+    chk('★W4 右列同时挂着质检 + 审计两张清单（不是切 tab 才看见）',
+      (await rv.locator('.rvside .tabroot').count()) === 2)
+
+    // 播放器要真的"变大"了 —— 这是搬出 420px 右栏的全部理由
+    const vh = await rv.locator('video.finalvid').boundingBox().catch(() => null)
+    const maxH = await rv.locator('video.finalvid').evaluate((el) => getComputedStyle(el).maxHeight)
+    chk('★W4 播放器按全屏放宽（不再受右栏 260px 限制）',
+      !!vh && parseFloat(maxH) > 300, `高=${vh && Math.round(vh.height)}px max-height=${maxH}`)
+
+    // 点质检行 → 播放头落到那一镜（W4 的核心新能力）。
+    // 一集一章 ⇒ 要分别测「问题在本集」和「问题在另一集」两条路：
+    // 后者必须先自动切集，否则会在 EP01 的文件里按 EP02 的比例尺定位（跳错还看着像对）。
+    await rv.waitForFunction(
+      () => (document.querySelector('video.finalvid') || {}).duration > 0,
+      null, { timeout: 15000 },
+    ).catch(() => {})
+    // 只认**长得像镜头号**的行（`1-2-03`）—— 审计里的「全片级」行不参与跳转。
+    const rowIds = (await rv.locator('.rvside .qcrow:not(.project) .sid').allInnerTexts())
+      .map((s) => s.trim()).filter((s) => /^\d+-\d+-\d+$/.test(s.split('、')[0]))
+    const curStem = ((await rv.locator('.epbtn.on').innerText().catch(() => '')) || 'EP01').trim()
+    const curNo = Number(curStem.replace(/\D/g, '')) || 1
+    const chOf = (id) => Number(String(id).split('-')[0]) || 0
+    const inEp = rowIds.find((id) => chOf(id) === curNo)
+    const other = rowIds.find((id) => chOf(id) !== curNo)
+
+    async function jumpLegend(id) {
+      await rv.locator('.rvside .qcrow:not(.project)')
+        .filter({ hasText: id }).first().click({ force: true })
+      await rv.waitForTimeout(1100)
+      return (await rv.locator('.seglegend').first().innerText()).replace(/\s+/g, ' ')
+    }
+    if (inEp) {
+      const legend = await jumpLegend(inEp)
+      chk('★W4 点本集质检行 → 播放头跳到那一镜（清单与画面同屏才做得到）',
+        legend.includes(inEp), `点的是 ${inEp}，条上显示「${legend.slice(0, 70)}」`)
+      chk('★W4 跳转成功时屏底不出提示（错了才说话）',
+        (await rv.locator('[data-testid=rv-hint]').count()) === 0)
+    } else {
+      skip('W4 本集内跳转', `夹具质检行 ${JSON.stringify(rowIds)} 里没有属于 ${curStem} 的镜头`)
+    }
+    if (other) {
+      const legend = await jumpLegend(other)
+      const nowStem = ((await rv.locator('.epbtn.on').innerText().catch(() => '')) || '').trim()
+      chk('★W4 点**另一集**的问题行会先自动切到那一集再跳（不跳错尺度）',
+        legend.includes(other) && nowStem === `EP${String(chOf(other)).padStart(2, '0')}`,
+        `点的是 ${other} → 当前集 ${nowStem}，条上「${legend.slice(0, 60)}」`)
+    } else {
+      skip('W4 跨集自动切集', `夹具质检行 ${JSON.stringify(rowIds)} 全在同一集里`)
+    }
+    // 下载链接只有一个、且跟着播放器所选集走（多集时"永远 EP01"是旧事故）。
+    // ★ 这里不能用 .epbtn.first()：上面那两条跳转断言已经把所选集切走了，
+    //   再点 first() 多半是"点当前集"= 无变化 —— 测试要按**当前是哪一集**挑对立面。
+    const stems = (await rv.locator('.epbtn').allInnerTexts()).map((s) => s.trim())
+    if (stems.length > 1) {
+      const onStem = (await rv.locator('.epbtn.on').innerText()).trim()
+      const target = stems.findIndex((s) => s !== onStem)
+      const dlSel = '[data-testid=rv-player] .summary a.dl'
+      const href0 = await rv.locator(dlSel).getAttribute('href')
+      await rv.locator('.epbtn').nth(target).click({ force: true })
+      await rv.waitForTimeout(900)
+      const href1 = await rv.locator(dlSel).getAttribute('href')
+      chk('★W4 下载跟着所选集变（不是第二个写死的真相）',
+        href0 !== href1 && href1.includes(`episode=${stems[target]}`), `${href0} → ${href1}`)
+      await rv.locator('.epbtn').nth(stems.indexOf(onStem)).click({ force: true })
+      await rv.waitForTimeout(700)
+    } else {
+      chk('★W4 单集项目不显示集切换器（只有多集才需要选）', stems.length <= 1)
+    }
+
+    await rv.screenshot({ path: '/tmp/vue-review.png' })
+    chk('★W4 审片屏无 JS 运行时错误', rvErrs.length === 0, rvErrs.slice(0, 2).join(' | '))
+  } catch (e) {
+    chk('★W4 审片屏（整段）', false, String(e).slice(0, 180))
+  } finally {
+    await rv.close()
   }
 }
 

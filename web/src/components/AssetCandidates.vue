@@ -73,7 +73,7 @@ async function enqueue(retried = false): Promise<void> {
     const r = await api.queueAdd(state.project, 'asset_gen', {
       kind: props.kind, id: props.id, n: 2,
     })
-    ElMessage.success((r.message as string) || '已入队')
+    ElMessage.success(r.message || '已入队')
     await refreshQueue()
   } catch (e) {
     // 预算护栏：弹审批框而不是干巴巴报错；批准 = 放行一次并重试
@@ -93,7 +93,7 @@ async function adopt(file: string) {
   busy.value = true
   try {
     const r = await api.assetAdopt(state.project, props.kind, props.id, file)
-    ElMessage.success((r.message as string) || '已采纳')
+    ElMessage.success(r.message || '已采纳')
     await refreshAssets()
   } catch (e) {
     ElMessage.error(`采纳失败：${(e as Error).message}`)
@@ -105,7 +105,7 @@ async function adopt(file: string) {
 /** 上传自有图 → 作为候选（和抽卡候选混在一起挑）。 */
 async function upload(filename: string, b64: string) {
   const r = await api.assetUpload(state.project, props.kind, props.id, filename, b64)
-  ElMessage.success((r.message as string) || '已上传')
+  ElMessage.success(r.message || '已上传')
   await refreshAssets()
 }
 </script>

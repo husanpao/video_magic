@@ -33,6 +33,7 @@ import subprocess
 import tempfile
 from fractions import Fraction
 from pathlib import Path
+from . import fsutil
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # 只为类型注解，运行时不 import（避免和并行开发的模块互相拖累）
@@ -80,14 +81,11 @@ def _which(tool: str) -> str:
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
-    """先写 .tmp 再 os.replace：字幕文件也不留半截（UTF-8、不转义中文、无 BOM）。"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    """原子写文本（字幕/concat 清单）。实现已收敛到 `vm/fsutil.py`。
+
+    字幕不留半截这条不变；`newline="\n"` 的显式 LF 语义由 fsutil 写字节天然满足。
+    """
+    fsutil.write_text(path, text)
 
 
 def _run(cmd: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess:

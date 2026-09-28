@@ -51,9 +51,9 @@ from . import style as _style
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from . import fsutil
 from typing import Any, Callable, Iterable
 
 try:  # 作为包导入（pipeline.py / 测试）
@@ -319,7 +319,8 @@ def _llm_json(
             if finish == "length":
                 raise PlanError(
                     f"LLM 输出被 max_tokens={max_tokens} 截断（{tag}）。"
-                    "请调大 max_tokens 或减小分块大小。"
+                    "可在「⚙ 设置 → 模型 → LLM 单次输出上限」调大（需模型支持），"
+                    "或减小分块大小；拆镜「重写」轮失败会自动回退到上一稿，不会白跑。"
                 )
             obj = _extract_json(text)
             meta = {
@@ -479,10 +480,9 @@ def _preset_of(cfg: dict, pcfg: dict | None = None) -> str:
     src = dict(cfg or {})
     if pcfg:
         src.update({k: v for k, v in pcfg.items() if v is not None})
-    v = src.get("style_preset")
-    if v:
-        return _style.resolve_preset(v)
-    return _style.resolve_preset(src.get("style"))
+    # 委托给 `style.preset_of` —— 全仓库唯一口径（原来是这里自己读 style_preset
+    # 再回落 style，而 chars/assets/storyboard 各写一遍且不回落，两边会静默打架）
+    return _style.preset_of(src)
 
 
 def _style_system_for(preset: str) -> str:
@@ -500,32 +500,6 @@ def _style_system_for(preset: str) -> str:
     if i > 0 and j > i:
         base = base[:i] + "  例：\n" + p["examples"] + "\n" + base[j:]
     return base + "\n【本片风格约束（必须严格遵守）】" + p["guidance"]
-
-
-def _derive_style(cfg: dict, chapter_text: str, log: Any, stats: dict) -> str:
-    """
-    从正文**自动推导**整片视觉风格句。失败返回空串（调用方退回 DEFAULT_STYLE）。
-
-    为什么需要（通用性）：`DEFAULT_STYLE` 是写死的"muted desaturated earthy tones"。
-    实测换题材才发现 —— 现代都市悬疑和古装神话拿到的是**同一句风格**，
-    结果新项目的定妆照和分镜全被染成"土黄写实"。项目级 `style` 配置项虽然存在
-    （`plan.py` 的 pcfg/cfg 都能给），但没人会记得每次都配。
-    把 `project.json` 的 `style` 设成 `"auto"` 即可让每部片自己定风格。
-    """
-    user = f"【正文】\n{chapter_text}\n\n按正文实际题材写风格句。"
-    try:
-        obj, meta = _llm_json(cfg, _style_system_for(_preset_of(cfg)), user,
-                              temperature=0.3, log=log, tag="风格推导")
-        stats["llm_calls"] = stats.get("llm_calls", 0) + 1
-        _accumulate_usage(stats, meta)
-        style = str((obj or {}).get("style") or "").strip().rstrip(".")
-        if style:
-            _log(log, f"  🎨 自动风格句：{style}")
-        return style
-    except Exception as e:
-        _log(log, f"  ⚠️ 风格推导失败，退回默认：{e}")
-        stats.setdefault("warnings", []).append(f"风格推导失败：{e}")
-        return ""
 
 
 def _card_style(cards: Iterable[CharCard]) -> str:
@@ -592,6 +566,8 @@ class PropCard:
     owner: str         # 归属角色（可空）
     description: str   # ★ 英文权威外观描述（逐字注入）
     inferred: bool = False   # True = 正文没给外观，是保守推断的通用形象，需人工复核
+    #: 同 SceneCard.chapters
+    chapters: list[int] = field(default_factory=list)
 
 
 _PROP_SYSTEM = """是漫剧制片。从小说章节正文里找出**需要在画面里保持一致外观的关键道具**，并写英文外观描述。
@@ -618,9 +594,104 @@ _PROP_SYSTEM = """是漫剧制片。从小说章节正文里找出**需要在画
 """ + DETAIL_CHECKLIST
 
 
-def _extract_props(cfg: dict, chapter_text: str, log: Any, stats: dict) -> list[PropCard]:
+_APPEARANCE_SYSTEM = """是漫剧制片。判断**本章正文里**哪些角色的**造型**与已登记的默认造型不同。
+
+【什么算"造型变化"（要报）】
+- 换衣服：明确脱掉/换上不同衣物（「她把湿透的外套挂在椅背上，换了件干衬衫」）
+- 身体状态改变且会出现在画面上：淋透、受伤包扎、脸部带伤、怀孕显怀、衰老/变年轻
+- 发型改变且被正文点名（剪短、剃发、染血打结）
+- 回忆 / 梦境 / 时间跳跃段落里人物明显更年轻或穿不同年代的衣服
+
+【什么**不**算（不要报，报了会白烧 GPU 出一张没用的专属定妆）】
+- 只是换个地方、换个姿势、换个表情
+- 只是加了配饰/道具（包、伞、武器）—— 那属于道具，不改角色造型
+- 正文没写、你根据"常识"补的（**严禁**：没写就不算变化）
+- 只是镜头光线不同（那由场景描述负责）
+
+★ `identity` 必须**一字不改地沿用给定的身份句**（脸/体型/发色/年龄），
+  变体只描述**差异部分**（穿什么、身上有什么）。
+  理由：身份由参考图锁死，重写身份句会让同一角色在两章长得不一样。
+
+【输出】严格 JSON：
+{"changes": [
+  {"name": "林樾", "variant_id": "wet_coat", "label": "湿透的风衣",
+   "costume": "Soaked dark wool coat clinging to the shoulders, water streaming from the hem, "
+              "hair plastered to the cheek",
+   "evidence": "从正文逐字抄出的 8-40 字，必须能在正文里原样找到"}
+]}
+没有变化就输出 {"changes": []} —— **空数组是常见且正确的答案，不要为了有输出而编造。**
+"""
+
+
+def _detect_appearance_changes(proj, cfg: dict, chapter_no: int, chapter_text: str,
+                               cards: dict, log: Any, stats: dict) -> list[dict]:
+    """
+    P3.3：拆镜时顺带判断"这一章谁换了造型"，并把变体登记进 `costumes.json`。
+
+    刻意做成**便宜的一次调用**（只送身份句 + 服装句，不送镜头表），
+    而且**只有报出来变化才落变体** —— 没变化就什么都不写，
+    项目维持"一角色一张全局定妆照"，成本与从前完全一致。
+    """
+    if not cards:
+        return []
+    known = []
+    for name, c in sorted(cards.items()):
+        known.append(f"- {name}：identity={getattr(c, 'appearance', '') or ''}；"
+                     f"costume={getattr(c, 'costume', '') or ''}")
+    user = (f"【已登记的角色与默认造型】\n" + "\n".join(known) +
+            f"\n\n【第 {chapter_no} 章正文】\n{chapter_text[:12000]}\n\n"
+            "只报正文真的写到的造型变化；没有就返回空数组。")
+    try:
+        obj, meta = _llm_json(cfg, _APPEARANCE_SYSTEM, user, temperature=0.1,
+                              log=log, tag="造型变化检测")
+        stats["llm_calls"] = stats.get("llm_calls", 0) + 1
+        _accumulate_usage(stats, meta)
+    except Exception as e:
+        _log(log, f"  ⚠️ 造型变化检测失败（跳过，本章沿用默认造型）：{e}")
+        stats.setdefault("warnings", []).append(f"造型变化检测失败：{e}")
+        return []
+
+    from vm import costumes as _cs
+
+    text_norm = re.sub(r"\s+", "", chapter_text)
+    out: list[dict] = []
+    for x in (obj.get("changes") if isinstance(obj, dict) else None) or []:
+        if not isinstance(x, dict):
+            continue
+        name = str(x.get("name") or "").strip()
+        costume = str(x.get("costume") or "").strip()
+        vid = str(x.get("variant_id") or "").strip()
+        ev = str(x.get("evidence") or "").strip()
+        if name not in cards:
+            _log(log, f"  ⏭ 丢弃未知角色的造型变化「{name}」")
+            continue
+        if not costume or not vid:
+            continue
+        # 与台词保真同一套纪律：evidence 必须能在正文里逐字找到，否则判为编造
+        if ev and re.sub(r"\s+", "", ev) not in text_norm:
+            _log(log, f"  ⏭ 丢弃 {name} 的造型变化：evidence 在正文里找不到（疑似编造）")
+            stats.setdefault("warnings", []).append(
+                f"{name} 的造型变化被丢弃：证据句「{ev[:24]}…」不在正文里")
+            continue
+        out.append({"name": name, "variant_id": vid, "label": str(x.get("label") or vid),
+                    "costume": costume, "chapter": chapter_no, "evidence": ev})
+    if not out:
+        return []
+    for c in out:
+        _cs.set_chapter_variant(proj, c["name"], chapter_no,
+                                variant_id=c["variant_id"], label=c["label"],
+                                prompt=c["costume"])
+    _log(log, f"  👕 第 {chapter_no} 章造型变化 {len(out)} 个："
+              + "、".join(f"{c['name']}→{c['variant_id']}" for c in out)
+              + "（要到「角色」屏按章出专属定妆照才会真的生效）")
+    return out
+
+
+def _extract_props(cfg: dict, chapter_text: str, log: Any, stats: dict,
+                   known: list[PropCard] | None = None) -> list[PropCard]:
     """从正文抽关键道具。失败返回空列表（plan 继续，只是没有道具锚定）。"""
-    user = f"【正文】\n{chapter_text}\n\n只依据正文，不要编造。"
+    user = (f"【正文】\n{chapter_text}\n\n只依据正文，不要编造。"
+            + _known_block(known or [], "P"))
     try:
         obj, meta = _llm_json(cfg, _PROP_SYSTEM + _style.guidance(_preset_of(cfg)), user,
                               temperature=0.2, log=log, tag="道具抽取")
@@ -658,15 +729,15 @@ def _extract_props(cfg: dict, chapter_text: str, log: Any, stats: dict) -> list[
     return out
 
 
-def save_props(proj, props: list[PropCard]) -> Path:
+def save_props(proj, props: list[PropCard], next_id: int = 0) -> Path:
+    """写 `props.json` 总表（原子写）。空列表也写，便于 UI 显示"还没抽出道具"。"""
     p = Path(proj.root) / "props.json"
-    data = {"version": 1, "props": [
+    data = {"version": 2, "next_id": _next_id_of(props, "P", next_id), "props": [
         {"id": c.id, "name": c.name, "owner": c.owner,
-         "description": c.description, "inferred": c.inferred} for c in props
+         "description": c.description, "inferred": c.inferred,
+         "chapters": list(c.chapters or [])} for c in props
     ]}
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, p)
+    fsutil.write_json(p, data)
     return p
 
 
@@ -681,9 +752,181 @@ def load_props(proj) -> dict[str, PropCard]:
     return {
         str(x["id"]): PropCard(id=str(x["id"]), name=str(x.get("name") or ""),
                                owner=str(x.get("owner") or ""), description=str(x.get("description") or ""),
-                               inferred=bool(x.get("inferred")))
+                               inferred=bool(x.get("inferred")),
+                               chapters=_chapters_of(x))
         for x in (d.get("props") or []) if isinstance(x, dict) and x.get("id")
     }
+
+
+
+# ── 跨章实体登记（P0.2）─────────────────────────────────────────────────────
+#
+# ★ 这一节修的是"多章项目的地基"。收敛前的行为：
+#   `_extract_scenes(cfg, chapter_text, …)` 只看**本章正文**，`save_scenes` **整表覆写**
+#   → 跑第二章就把第一章抽的场景全冲掉；而且 `id` 每章都从 S1 重新编号，
+#     于是 S1 在第 1 章是「末班地铁车厢」、在第 2 章是「站台」。
+#   线上实测（projects/雨夜地铁）：`chapter01.json` 的 14 镜引用 S1/S2，
+#   而 `scenes.json` 里的 S1 现在是第二章的「站台」—— 第一章那段场景锚定文字**已经没了**，
+#   第 1 章那 14 镜的描述被静默换成了另一个地方。
+#
+# 为什么这是硬故障而不是"数据不好看"：`scene_id` 是**存在镜头表里的外键**
+# （`shots.py:137`，逐字注入靠它），所以 id 一旦被镜头引用过，就**绝不能重新分配** ——
+# 重排的后果是已渲的镜头静默指向另一个地点，而画面照样正常生成、质检照样通过，
+# 属于最难发现的一类错位。这里的规则全部围绕这条：
+#   1. id **只增不改**：已登记的实体保持原 id，新实体用**全局单调**递增的高水位号；
+#   2. 同名（归一化后）视为同一实体 → 合并、并上章节号，**不新建**；
+#   3. LLM 交回来的 id 若撞上"名字不同"的已登记实体 → 不覆盖，另发新 id，并**报冲突**；
+#   4. 已登记实体的 description 是权威（已经注入过镜头了），新章节抽出不同文字只告警不改写。
+
+
+def _chapters_of(raw: dict) -> list[int]:
+    """
+    读 `chapters` 字段。**v1 文件里没有这个字段 → 返回空列表，含义是"未知"**，
+    绝不能当成"没在任何章出现过"（那会让所有旧实体看起来都可删）。
+    """
+    v = raw.get("chapters")
+    if not isinstance(v, list):
+        return []
+    out: list[int] = []
+    for x in v:
+        try:
+            n = int(x)
+        except (TypeError, ValueError):
+            continue
+        if n > 0 and n not in out:
+            out.append(n)
+    return sorted(out)
+
+
+def _next_id_of(cards: list, prefix: str, hint: int = 0) -> int:
+    """
+    id 高水位。**必须存下来而不是每次 max(现有 id)** ——
+    否则删掉 S2 之后，下一个新场景会重新拿到 S2，而旧镜头表里还有一堆镜头
+    指着"当年那个 S2"，它们会静默指向一个新地点。
+    """
+    hi = int(hint or 0)
+    for c in cards or []:
+        n = _id_serial(getattr(c, "id", ""), prefix)
+        if n and n > hi:
+            hi = n
+    return hi
+
+
+def registry_next_id(proj, filename: str) -> int:
+    """从总表文件里读 id 高水位（缺失/损坏 → 0，让 merge 退回 max(现有 id)）。"""
+    p = Path(proj.root) / filename
+    if not p.is_file():
+        return 0
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return 0
+    try:
+        return int(d.get("next_id") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _entity_key(name: str) -> str:
+    """
+    实体名的归一化键，用于"同一个地点/同一件道具"的判定。
+
+    只做**保守**的归一：去空白与标点、去「的」这类连接字、casefold。
+    刻意不做近义词/上位词合并（「车厢」vs「地铁车厢」靠字符串归一能对上，
+    「末班地铁」vs「车厢」对不上）—— 判错方向的代价不对称：
+    漏合并 = 多一个实体，界面里看得见、P3.1 能手工合并；
+    错合并 = 两个地点变成一个描述，静默污染所有相关镜头，**救不回来**。
+    """
+    import unicodedata
+
+    t = unicodedata.normalize("NFKC", str(name or "")).casefold().strip()
+    t = re.sub(r"[\s\u3000]+", "", t)
+    t = re.sub(r"[，。、；：""''（）()\[】《》〈〉·—\-_/\\,.:;!?]", "", t)
+    return t
+
+
+def _id_serial(eid: str, prefix: str) -> int | None:
+    """`S12` → 12；不是 `<prefix><数字>` 形状返回 None。"""
+    m = re.fullmatch(rf"{re.escape(prefix)}(\d+)", str(eid or "").strip())
+    return int(m.group(1)) if m else None
+
+
+def merge_entities(existing: dict[str, Any], incoming: list[Any], *,
+                   chapter_no: int, prefix: str, label: str,
+                   high_water: int = 0, log: Any = None) -> tuple[list[Any], dict]:
+    """
+    把本章抽出的实体并入已登记总表。返回 `(合并后的列表, 报告)`。
+
+    报告键：`added`（新建的 id+名）、`matched`（对上已登记实体的）、
+    `conflicts`（id 被不同名字抢占 —— **必须让人看见**）、
+    `desc_differs`（同一实体两章描述不一致）。
+    """
+    report: dict[str, list] = {"added": [], "matched": [], "conflicts": [], "desc_differs": []}
+    out: dict[str, Any] = {eid: c for eid, c in (existing or {}).items()}
+    by_key = {_entity_key(c.name): c for c in out.values() if getattr(c, "name", "")}
+    nxt = max([high_water] + [_id_serial(e, prefix) or 0 for e in out] + [0])
+
+    def _fresh_id() -> str:
+        nonlocal nxt
+        nxt += 1
+        return f"{prefix}{nxt}"
+
+    for c in incoming or []:
+        key = _entity_key(getattr(c, "name", ""))
+        hit = by_key.get(key) if key else None
+        if hit is not None:
+            # 同名 = 同一实体。合并出现记录，不改它的 id，也不改它的权威描述。
+            if chapter_no and chapter_no not in (hit.chapters or []):
+                hit.chapters = list(hit.chapters or []) + [chapter_no]
+            old_desc = str(getattr(hit, "description", "") or "").strip()
+            new_desc = str(getattr(c, "description", "") or "").strip()
+            if old_desc and new_desc and old_desc != new_desc:
+                report["desc_differs"].append(
+                    f"{hit.id}「{hit.name}」第 {chapter_no} 章抽出不同的视觉描述 —— "
+                    f"沿用已登记的权威描述（它已被逐字注入前面章节的镜头），"
+                    f"要改请到控制台「{label}」页手工改")
+            report["matched"].append(f"{hit.id} {hit.name}")
+            if c.id != hit.id:
+                report["matched"][-1] += f"（本章编号 {c.id} → 归并到 {hit.id}）"
+            continue
+
+        cid = str(getattr(c, "id", "") or "").strip()
+        taken = out.get(cid)
+        if taken is not None:
+            # id 被占但名字不同 —— 两章各自从 1 编号时必然发生。
+            # 绝不覆盖已登记的实体，另发新 id，并把冲突原样报出来。
+            new_id = _fresh_id()
+            report["conflicts"].append(
+                f"本章把 {cid} 用作「{c.name}」，但总表里 {cid} 已是「{taken.name}」"
+                f"—— 未覆盖，本章该实体另记为 {new_id}")
+            c.id = new_id
+        elif not _id_serial(cid, prefix):
+            c.id = _fresh_id()
+        if chapter_no and chapter_no not in (c.chapters or []):
+            c.chapters = list(c.chapters or []) + [chapter_no]
+        out[c.id] = c
+        if key:
+            by_key[key] = c
+        report["added"].append(f"{c.id} {c.name}")
+
+    ordered = sorted(out.values(), key=lambda c: (_id_serial(c.id, prefix) or 10 ** 6, str(c.id)))
+    return ordered, {"next_id": nxt, **report}
+
+
+def merge_scenes(proj, incoming: list[SceneCard], chapter_no: int,
+                 log: Any = None) -> tuple[list[SceneCard], dict]:
+    """把本章场景并入 `scenes.json` 总表（**追加合并，不覆写**）。"""
+    return merge_entities(load_scenes(proj), incoming, chapter_no=chapter_no,
+                          prefix="S", label="场景",
+                          high_water=registry_next_id(proj, "scenes.json"), log=log)
+
+
+def merge_props(proj, incoming: list[PropCard], chapter_no: int,
+                log: Any = None) -> tuple[list[PropCard], dict]:
+    """把本章道具并入 `props.json` 总表（同上）。"""
+    return merge_entities(load_props(proj), incoming, chapter_no=chapter_no,
+                          prefix="P", label="道具",
+                          high_water=registry_next_id(proj, "props.json"), log=log)
 
 
 # ── 场景实体（2026-09-23）────────────────────────────────────────────────
@@ -706,6 +949,9 @@ class SceneCard:
     lighting: str      # 光线
     atmosphere: str    # 氛围
     description: str   # ★ 英文权威视觉描述（逐字注入，保证跨镜一致）
+    #: 这个地点出现在哪些章（1-based）。跨章 merge 的凭据，也是 P3.1「实体总表」
+    #: 判断"这个景影响几章"的依据。旧数据没这个字段 → 空列表 = **未知**，不是"0 章"。
+    chapters: list[int] = field(default_factory=list)
 
 
 _SCENE_SYSTEM = """是漫剧制片。从小说章节正文里找出**不同的地点/场景**，并为每个场景写一段英文视觉描述。
@@ -761,9 +1007,22 @@ def _no_placeholder(v: Any) -> str:
     return t
 
 
-def _extract_scenes(cfg: dict, chapter_text: str, log: Any, stats: dict) -> list[SceneCard]:
+def _known_block(cards: list, prefix: str, extra: str = "") -> str:
+    """已登记实体清单（喂给抽取提示词，让它**复用 id**而不是每章从 1 重编）。"""
+    if not cards:
+        return ""
+    lines = [f"- {c.id} {c.name}{extra}" for c in cards]
+    return ("\n\n【已登记实体总表】（本项目前面章节已经建过的实体。"
+            "★ 本章里**同一个地点/同一件道具**必须**沿用它的 id**，不要另发新号；"
+            "只有确实是新实体才给新 id，新 id 从总表最大号往后编）\n"
+            + "\n".join(lines))
+
+
+def _extract_scenes(cfg: dict, chapter_text: str, log: Any, stats: dict,
+                    known: list[SceneCard] | None = None) -> list[SceneCard]:
     """从章节正文抽场景实体。失败返回空列表（plan 仍可继续，只是没有场景锚定）。"""
-    user = f"【正文】\n{chapter_text}\n\n只依据正文，不要编造。"
+    user = (f"【正文】\n{chapter_text}\n\n只依据正文，不要编造。"
+            + _known_block(known or [], "S"))
     try:
         obj, meta = _llm_json(cfg, _SCENE_SYSTEM + _style.guidance(_preset_of(cfg)), user,
                               temperature=0.2, log=log, tag="场景抽取")
@@ -807,21 +1066,21 @@ def _extract_scenes(cfg: dict, chapter_text: str, log: Any, stats: dict) -> list
     return out
 
 
-def save_scenes(proj, scenes: list[SceneCard]) -> Path:
-    """写 `scenes.json`（原子写）。空列表也写，便于 UI 显示"本章未抽出场景"。"""
+def save_scenes(proj, scenes: list[SceneCard], next_id: int = 0) -> Path:
+    """写 `scenes.json` 总表（原子写）。空列表也写，便于 UI 显示"还没抽出场景"。"""
     p = Path(proj.root) / "scenes.json"
     data = {
-        "version": 1,
+        "version": 2,
+        "next_id": _next_id_of(scenes, "S", next_id),
         "scenes": [
             {"id": c.id, "name": c.name, "location": c.location,
              "time_of_day": c.time_of_day, "lighting": c.lighting,
-             "atmosphere": c.atmosphere, "description": c.description}
+             "atmosphere": c.atmosphere, "description": c.description,
+             "chapters": list(c.chapters or [])}
             for c in scenes
         ],
     }
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, p)
+    fsutil.write_json(p, data)
     return p
 
 
@@ -843,6 +1102,7 @@ def load_scenes(proj) -> dict[str, SceneCard]:
             location=str(x.get("location") or ""), time_of_day=str(x.get("time_of_day") or ""),
             lighting=str(x.get("lighting") or ""), atmosphere=str(x.get("atmosphere") or ""),
             description=str(x.get("description") or ""),
+            chapters=_chapters_of(x),
         )
     return out
 
@@ -1064,14 +1324,8 @@ def write_char_prompts(proj: Project, chars: list[CharCard]) -> dict[str, Path]:
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
-    """先写 .tmp 再 os.replace（与 state.py/shots.py 同一策略，不允许半截文件）。"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    """原子写文本（角色提示词 / 备份）。实现已收敛到 `vm/fsutil.py`。"""
+    fsutil.write_text(path, text)
 
 
 # ── 拆镜提示词（可单独迭代，不动代码逻辑）──────────────────────────────────
@@ -1200,17 +1454,34 @@ def _cn_number(s: str) -> int:
 
 
 def chapter_number(chapter_path: Path, cfg: dict) -> int:
-    """章节号：优先 cfg，其次从文件名「第X章」解析，最后 1。"""
+    """
+    章节号：**清单里登记的 no 最优先**，其次 `cfg` 显式指定，再次文件名解析，最后 1。
+
+    为什么清单排在 cfg 前面：`no` 是镜头表文件名（`chapterNN.json`）、镜头 id 前缀
+    （`1-2-03`）和成片集数（`EP01.mp4`）三处共同的主键。同一个文件在两处拿到不同的
+    `no`，产物就会**互相覆盖**（P0.3 的"跨章歧义"里最坏的一种）。
+    清单一旦登记过，它就是真相；`cfg.plan.chapter` 只对"清单里还没有这个文件"的情形兜底。
+    """
+    from vm import chapters as _ch
+
+    try:
+        for e in _ch.load(_proj_root_of(chapter_path)):
+            if Path(e.file).name == Path(chapter_path).name and e.no:
+                return e.no
+    except Exception:
+        pass
     p = cfg.get("plan") if isinstance(cfg.get("plan"), dict) else {}
     explicit = _as_int(p.get("chapter", cfg.get("chapter")))
     if explicit and explicit > 0:
         return explicit
-    m = re.search(r"第([零一二两三四五六七八九十\d]+)[章回]", Path(chapter_path).stem)
-    if m:
-        n = _cn_number(m.group(1))
-        if n > 0:
-            return n
-    return 1
+    n = _ch.parse_chapter_no(Path(chapter_path).stem)
+    return n or 1
+
+
+def _proj_root_of(chapter_path: Path):
+    """`<项目>/novel/x.md` → `<项目>`。不在项目结构里就返回 None（清单读失败自然跳过）。"""
+    p = Path(chapter_path).resolve()
+    return p.parent.parent if p.parent.name == "novel" else None
 
 
 def _as_int(value: Any, default: int | None = None) -> int | None:
@@ -1342,10 +1613,13 @@ def _validate_table(
     """
     校验阶段①输出。返回 (shots, new_cards, unknown, issues)。
 
-    issues 分三档（前缀决定处置方式）：
+    issues 分四档（前缀决定处置方式）：
       硬问题（无前缀）→ 重写 1 轮后仍不合格就报错（chars 空/角色没卡/sec 出域/action 空）
-      "__fix__" 必须先让 LLM 改一次的问题（正文对白丢失、语音超单镜上限）；
-                重写后仍存在则只告警继续（前者人工看表补，后者有自动拆镜兜底）
+      "__fix__" 必须先让 LLM 改一次的问题（正文对白丢失、语音超单镜上限、拆得过碎）；
+                重写后仍存在则只告警继续（前者人工看表补，后者有自动拆镜/合并兜底）
+      "__note__" 只记录、**绝不触发重写**的软通知（已补卡但本稿未让他出镜）——
+                2026-09-28 事故后新增：为这种软意见重写，第二稿被 max_tokens 截断会把
+                本来合格的第一稿一起丢掉，整章拆镜失败。
       "__style__" 风格建议（台词 >20 字、拆得过碎）→ 只记录，不触发重写、不阻断
     
     台词长短是**风格偏好**：正文里的原句可能本来就 40 字，强行拆成两镜会把一句话
@@ -2256,7 +2530,14 @@ def plan_chapter(
     if m:
         title = (m.group(1) + " " + m.group(2)).strip()
 
-    allow_new = bool(pcfg.get("allow_new_characters", False))
+    # allow_new_characters 三态：未设置(None) = **默认允许**（用到才建卡；防幻觉有两道闸：
+    #   名字必须真的出现在本章正文里 + 总数不超过 MAX_NEW_CARDS）；true/false = 用户显式决定。
+    # ★ 2026-09-28 事故：原来"未设置"等于 False —— 全新项目一张卡都没有时，每个有名字的角色
+    #   都被判「没有卡」，重写一轮还是没卡，整章拆镜失败（实测 51 条硬问题）。
+    #   既有项目（雨夜地铁/西游记）都因为 project.json 里显式写了 true 才躲过这个坑；
+    #   而第 2 章起若出现新角色，同样会被这个默认值卡死 —— 所以默认必须放宽。
+    allow_new_raw = pcfg.get("allow_new_characters", None)
+    allow_new = True if allow_new_raw is None else bool(allow_new_raw)
     chars_per_sec = float(pcfg.get("chars_per_sec", CHARS_PER_SEC))
     base_seed = _as_int(pcfg.get("seed", cfg.get("seed", 3100)), 3100) or 3100
     ch_no = chapter_number(chapter_path, cfg)
@@ -2267,6 +2548,9 @@ def plan_chapter(
     ref_names = sorted(p.name[len("char_") : -len(".png")] for p in refs_dir.glob("char_*.png")) if refs_dir.is_dir() else []
     if not locked and not ref_names:
         _log(log, "  ⚠️ 没有发现任何角色卡或参考图：chars 只能由 LLM 新建角色（质量不可控）")
+        if allow_new:
+            _log(log, "  ℹ 已开启「按需建卡」：阶段⓪先从正文抽角色卡，拆镜时用到的角色当场补卡。"
+                      "要显式关掉：项目设置 plan.allow_new_characters=false")
     for name in ref_names:
         if name not in locked:
             _log(log, f"  ⚠️ 角色「{name}」有参考图但没有 prompts/char_{name}.txt："
@@ -2275,18 +2559,25 @@ def plan_chapter(
     # stats 的字面量里要用到 style（`"style": style`），所以顺序不能反。
     # （第一版把 stats 提到前面，结果 UnboundLocalError: style referenced before assignment。）
     # 顺序：项目级显式配置 → "auto" 自动推导 → 已有卡的风格 → 默认
-    _style_cfg = str(pcfg.get("style") or cfg.get("style") or "").strip()
-    if _style_cfg.lower() == "auto":
-        # 自动推导需要一个可写的 stats 容器（它会计 token 与告警）——
-        # 这里先建 stats，推完再把 style 回填进去。
-        stats: dict[str, Any] = {}
-        style = (_derive_style(cfg, chapter_text, log, stats)
-                 or _card_style(locked.values())
-                 or _style.get(_preset_of(cfg, pcfg))["sentence"])
-    else:
-        stats = {}
-        style = (_style_cfg or _card_style(locked.values())
-                 or _style.get(_preset_of(cfg, pcfg))["sentence"])
+    # ── ★ P2.2：风格句改成**整本小说级** ────────────────────────────────
+    # 原来这里是"每章推一次"（`_derive_style(cfg, chapter_text, …)`），两个后果：
+    #   ① 跨章漂移 —— 第 1 章被判冷青调、第 2 章被判暖褐调，而风格句**逐字进每一镜提示词**，
+    #      成片自己跟自己打架；
+    #   ② 改风格会让**所有**镜头变 stale（prompt 进指纹），但界面上既没有"整本风格"
+    #      这个概念、也没有任何影响提示。
+    # 现在从 `style.json` 读；没定过时 `ensure_style` 会自动跑一次**整本**推荐
+    # （门禁做成自动的，不逼用户多点一个按钮）。
+    stats: dict[str, Any] = {}
+    from vm import register as _reg
+
+    _bs = _reg.ensure_style(proj, cfg, log)
+    style = str(_bs.get("sentence") or "").strip()
+    if _bs.get("source") == "user":
+        _log(log, f"  🎨 风格（人工已确认）：{_bs.get('preset')}")
+    stats["style_source"] = _bs.get("source") or "preset"
+    stats["style_preset"] = _bs.get("preset") or _preset_of(cfg, pcfg)
+    if not style:
+        style = _style.get(stats["style_preset"])["sentence"]
 
     stats.update({
         "chapter": str(chapter_path),
@@ -2350,26 +2641,64 @@ def plan_chapter(
     # 数据里的 `scene` 只是场次号（实测 52 镜分成 47 个场次，几乎每镜一个），
     # **"场景"这一层从来没真正建立过** —— 同一间破庙的墙/光/色调每镜各写各的。
     # 这里抽出真正的地点，之后同 scene_id 的镜头注入同一段场景描述。
-    scenes = _extract_scenes(cfg, chapter_text, log, stats)
+    # ★ P0.2：抽完**并入总表**而不是整表覆写。
+    # 收敛前这里是 `save_scenes(proj, scenes)` —— 直接写本章的列表，于是跑第二章
+    # 就把第一章抽的场景全部冲掉（实测《雨夜地铁》第 1 章那 14 镜的 scene_id 因此
+    # 指向了第 2 章的地点描述）。现在：先读总表喂给 LLM 复用 id，抽完再 merge 回去。
+    known_scenes = list(load_scenes(proj).values())
+    raw_scenes = _extract_scenes(cfg, chapter_text, log, stats, known=known_scenes)
+    scenes, srep = merge_scenes(proj, raw_scenes, ch_no, log)
     scene_map = {c.id: c for c in scenes}
     if scenes:
-        sp = save_scenes(proj, scenes)
-        _log(log, f"  🏞 场景实体 {len(scenes)} 个：" +
+        sp = save_scenes(proj, scenes, srep.get("next_id", 0))
+        _log(log, f"  🏞 场景总表 {len(scenes)} 个（本章新增 {len(srep['added'])}、"
+                  f"复用 {len(srep['matched'])}）：" +
              "、".join(f"{c.id} {c.name}" for c in scenes) + f" → {sp.name}")
     else:
         _log(log, "  ⚠️ 未抽出场景实体（plan 继续，但没有跨镜场景锚定）")
-    stats["scenes"] = [{"id": c.id, "name": c.name} for c in scenes]
+    for w in srep.get("conflicts", []):
+        _log(log, f"  ⚠️ 场景 id 冲突：{w}")
+        stats.setdefault("warnings", []).append(f"场景 id 冲突：{w}")
+    for w in srep.get("desc_differs", []):
+        _log(log, f"  ℹ 场景描述不一致：{w}")
+        stats.setdefault("warnings", []).append(w)
+    stats["scenes"] = [{"id": c.id, "name": c.name, "chapters": list(c.chapters or [])}
+                       for c in scenes]
 
     # ── 阶段①.6：抽关键道具实体 ──
-    props = _extract_props(cfg, chapter_text, log, stats)
+    # ── 阶段①.7：造型变化检测（P3.3）──
+    # 一次便宜的调用：只送身份句 + 服装句 + 正文，不送镜头表。
+    # **没变化就什么都不写** ⇒ 项目维持"一角色一张全局定妆照"，成本与从前完全一致；
+    # 报了变化才登记变体，且证据句必须能在正文里逐字找到（与台词保真同一套纪律），
+    # 否则判为编造丢弃 —— 编出来的"换装"会白烧一次定妆 GPU 并污染该章所有镜头。
+    try:
+        app_changes = _detect_appearance_changes(
+            proj, cfg, ch_no, chapter_text, cards, log, stats)
+    except Exception as e:                       # 绝不让它拖垮拆镜
+        _log(log, f"  ⚠️ 造型变化检测异常（已跳过）：{type(e).__name__}: {e}")
+        app_changes = []
+    stats["appearance_changes"] = app_changes
+
+    known_props = list(load_props(proj).values())
+    raw_props = _extract_props(cfg, chapter_text, log, stats, known=known_props)
+    props, prep = merge_props(proj, raw_props, ch_no, log)
     prop_map = {c.id: c for c in props}
     if props:
-        pp = save_props(proj, props)
-        _log(log, f"  🗡 关键道具 {len(props)} 个：" +
-             "、".join(f"{c.id} {c.name}" + ("(推断)" if c.inferred else "") for c in props) + f" → {pp.name}")
+        pp = save_props(proj, props, prep.get("next_id", 0))
+        _log(log, f"  🗡 道具总表 {len(props)} 个（本章新增 {len(prep['added'])}、"
+                  f"复用 {len(prep['matched'])}）：" +
+             "、".join(f"{c.id} {c.name}" + ("(推断)" if c.inferred else "") for c in props) +
+             f" → {pp.name}")
     else:
         _log(log, "  ⚠️ 未抽出关键道具")
-    stats["props"] = [{"id": c.id, "name": c.name, "inferred": c.inferred} for c in props]
+    for w in prep.get("conflicts", []):
+        _log(log, f"  ⚠️ 道具 id 冲突：{w}")
+        stats.setdefault("warnings", []).append(f"道具 id 冲突：{w}")
+    for w in prep.get("desc_differs", []):
+        _log(log, f"  ℹ 道具描述不一致：{w}")
+        stats.setdefault("warnings", []).append(w)
+    stats["props"] = [{"id": c.id, "name": c.name, "inferred": c.inferred,
+                       "chapters": list(c.chapters or [])} for c in props]
 
     # ── 阶段①：分块拆镜表 ──
     chunks = _chunk_text(chapter_text)
@@ -2383,19 +2712,36 @@ def plan_chapter(
         unknown: list[str] = []
         issues: list[str] = []
         style_issues: list[str] = []
+        fallback: dict | None = None  # 第 1 稿已合格时的快照，供第 2 稿失败兜底
         for round_no in (1, 2):
-            obj, meta = _llm_json(
-                cfg,
-                TABLE_SYSTEM,
-                _table_user_prompt(
-                    title=title, chapter_text=chunk, chunk_no=ci, chunk_total=len(chunks),
-                    cards=cards, allowed=allowed, style=style,
-                    unknown_so_far=stats["unknown_characters"], allow_new=allow_new,
-                    feedback=feedback, scenes=scenes, props=props,
-                ),
-                temperature=DEFAULT_TEMPERATURE if round_no == 1 else 0.2,
-                log=log, tag=f"拆镜表 块{ci} 第{round_no}稿",
-            )
+            try:
+                obj, meta = _llm_json(
+                    cfg,
+                    TABLE_SYSTEM,
+                    _table_user_prompt(
+                        title=title, chapter_text=chunk, chunk_no=ci, chunk_total=len(chunks),
+                        cards=cards, allowed=allowed, style=style,
+                        unknown_so_far=stats["unknown_characters"], allow_new=allow_new,
+                        feedback=feedback, scenes=scenes, props=props,
+                    ),
+                    temperature=DEFAULT_TEMPERATURE if round_no == 1 else 0.2,
+                    log=log, tag=f"拆镜表 块{ci} 第{round_no}稿",
+                )
+            except PlanError as e:
+                # ★ 2026-09-28 事故的兜底：重写轮失败（最常见是被 max_tokens 截断）
+                #   **绝不能连累已经合格的第一稿** —— 有快照就采用它继续，只告警。
+                #   没有快照（第一稿就失败/第一稿本身有硬问题）才真的抛。
+                if fallback is None:
+                    raise
+                _log(log, f"    ⚠️ 块 {ci} 第 {round_no} 稿失败（{e}），"
+                          f"回退到第 1 稿继续（该稿硬问题已清零）")
+                stats["warnings"].append(f"第 {ci} 块：第 {round_no} 稿失败，已回退第 1 稿（{e}）")
+                snap = [i[len("__fix__") :] for i in fallback["issues"] if i.startswith("__fix__")]
+                stats["warnings"].extend(f"第 {ci} 块（回退第 1 稿后仍待改）：{s}" for s in snap)
+                rows = fallback["rows"]
+                cards_out = fallback["cards_out"]
+                unknown = fallback["unknown"]
+                break
             stats["llm_calls"] += 1
             _accumulate_usage(stats, meta)
             # allow_new=False：角色卡已在阶段①之前建好（含新角色），所以这里
@@ -2424,31 +2770,45 @@ def plan_chapter(
                             obj, set(allowed), False, chunk_text=chunk, chars_per_sec=chars_per_sec
                         )
                         for n in added:
-                            # 用 __fix__ 而不是硬问题：卡已经补好了（交付物到手），
-                            # 这一稿没让他出镜只是"不理想"，不该让整章拆镜失败
+                            # 用 __note__（只记录）而不是 __fix__（触发重写）或硬问题：
+                            # 卡已经补好了（交付物到手），这一稿没让他出镜只是"不理想"。
+                            # ★ 2026-09-28 事故：这里原来是 __fix__ → 触发第二稿重写 →
+                            #   第二稿被 max_tokens 截断 → 整章拆镜失败，第一稿白丢。
                             issues.append(
-                                f"__fix__「{n}」有戏份，角色卡已经补好并列入【可用角色】，"
-                                f"本稿却仍把他当成无卡角色/画外音：请把他正常写进相关镜头的 chars，让他出镜"
+                                f"__note__「{n}」有戏份，角色卡已经补好并列入【可用角色】，"
+                                f"本稿仍把他当无卡角色/画外音：重跑一次拆镜即可让他出镜"
                             )
             hard = [i for i in issues if not i.startswith("__")]
-            cover = [i[len("__fix__") :] for i in issues if i.startswith("__fix__")]
+            fix = [i[len("__fix__") :] for i in issues if i.startswith("__fix__")]
+            note = [i[len("__note__") :] for i in issues if i.startswith("__note__")]
             style_issues = [i[len("__style__") :] for i in issues if i.startswith("__style__")]
-            if not hard and not cover:
+            if note:
+                # 只告警、不重写：补卡已落盘，重跑拆镜时卡已存在，自然就会出镜
+                stats["warnings"].extend(f"第 {ci} 块：{s}" for s in note)
+                _log(log, f"    ℹ 块 {ci}：已补卡但本稿未出镜（{len(note)} 条），"
+                          f"重跑「拆镜」即会出镜（卡已存在，不会再触发补卡）")
+            if not hard and not fix:
                 break
             if round_no == 1:
-                # 硬问题 / 对白丢失必须重写；纯风格建议不触发重写（模型可能越改越碎）
+                # 硬问题 / 对白丢失 / 语音超限必须重写；__note__ 与纯风格建议不触发重写
+                # 第一稿"硬问题清零"时先存快照：这样万一第 2 稿失败也能全身而退
+                if not hard:
+                    fallback = {"rows": rows, "cards_out": cards_out,
+                                "unknown": list(unknown), "issues": list(issues)}
                 stats["rewrites"] += 1
-                feedback = "\n".join(f"- {i}" for i in (hard + cover))
-                _log(log, f"    ↻ 块 {ci} 第 1 稿有问题，按意见重写：{'；'.join((hard + cover))[:160]}")
+                feedback = "\n".join(f"- {i}" for i in (hard + fix))
+                _log(log, f"    ↻ 块 {ci} 第 1 稿有问题，按意见重写：{'；'.join((hard + fix))[:160]}")
                 continue
             if hard:
                 raise PlanError(
                     f"拆镜表重写 1 轮后仍不合格（第 {ci} 块）：\n"
                     + "\n".join(f"  - {i}" for i in hard)
                 )
-            # 对白丢失重写后仍存在：内容缺失必须让用户看见，但不阻断（镜头表可手改）
-            stats["warnings"].extend(f"第 {ci} 块（重写后仍未解决）：{s}" for s in cover)
-            _log(log, f"    ⚠️ 块 {ci} 重写后仍有对白未入镜：{cover[0][:100]}")
+            # 对白丢失/语音超限重写后仍存在：内容缺失必须让用户看见，但不阻断
+            # （镜头表可手改；语音超限还有 _split_speech 兜底）
+            stats["warnings"].extend(f"第 {ci} 块（重写后仍未解决）：{s}" for s in fix)
+            if fix:
+                _log(log, f"    ⚠️ 块 {ci} 重写后仍有待改问题：{fix[0][:100]}")
             break
         stats["warnings"].extend(f"第 {ci} 块：{s}" for s in style_issues)
 

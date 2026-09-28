@@ -24,13 +24,13 @@ from __future__ import annotations
 
 import fcntl
 import json
-import os
 import threading
 import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from . import fsutil
 from typing import Any
 
 QUEUE_FILENAME = "queue.json"
@@ -134,9 +134,7 @@ def write_all(proj, jobs: list[Job]) -> None:
     # 只保留最近 200 条，避免队列文件无限增长
     keep = jobs[-200:]
     data = {"version": 1, "jobs": [j.to_dict() for j in keep]}
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, p)
+    fsutil.write_json(p, data)
 
 
 def add(proj, kind: str, args: dict) -> Job:
@@ -305,7 +303,9 @@ def drain(proj, log=lambda m: print(m), should_stop=None) -> dict:
                 kind = str(j.args.get("kind") or "")
                 aid = str(j.args.get("id") or "")
                 n = int(j.args.get("n") or 2)
-                made = A.gen_candidates(proj, kind, aid, n=n,
+                from vm import taskctl as _T
+                params = _T.load_params(proj.root)
+                made = A.gen_candidates(proj, kind, aid, n=n, params=params,
                                         log=lambda m: log("  " + str(m)))
                 note = f"新出 {len(made)} 张"
                 log(f"✅ [{j.id}] {label} — {note}")
@@ -313,15 +313,38 @@ def drain(proj, log=lambda m: print(m), should_stop=None) -> dict:
                 # 角色抽卡原来走的是 gacha 阶段（任务模型，已是非阻塞的）。
                 # 这里把它接进统一队列，好处是**能和场景/道具的作业排在同一条队里** ——
                 # 用户不必关心"这次点的是哪种抽卡"。
-                import json as _json
                 from vm import chars as _chars
-                from vm.state import Project as _P
+                from vm import taskctl as _T
                 name = str(j.args.get("name") or "")
                 n = int(j.args.get("n") or 2)
-                params = _json.loads((Path(proj.root) / "project.json").read_text(encoding="utf-8"))
-                made = _chars.gen_candidates(proj, name, params, n=n,
+                ch = j.args.get("chapter")
+                try:
+                    ch = int(ch) if ch not in (None, "", 0) else None
+                except (TypeError, ValueError):
+                    ch = None
+                # 走 load_params 而不是手读 project.json —— 手读会丢掉 DEFAULT_PARAMS
+                # 与全局配置层的兜底值（comfy_url / unet / lora / steps …）。
+                params = _T.load_params(proj.root)
+                made = _chars.gen_candidates(proj, name, params, n=n, chapter=ch,
                                              log=lambda m: log("  " + str(m)))
                 note = f"新出 {len(made)} 张"
+                log(f"✅ [{j.id}] {label} — {note}")
+            elif j.kind == "storyboard":
+                # ★ 这一支以前**不存在**：`storyboard` 在 JOB_KINDS 里登记了、
+                # budget 里也给了 GPU 单价，但 drain 走到这里会抛
+                # "不支持的作业类型" —— 声明了能排队、实际一排就失败。
+                # （是 P2 的「按新风格重出分镜图」把它第一次调用出来才暴露的。）
+                from vm import storyboard as _SB
+                from vm.qi import QIConfig
+                sid = str(j.args.get("id") or "")
+                only = None if sid in ("", "all", "*") else [sid]
+                r = _SB.render_all(proj, QIConfig(), only=only,
+                                   force=bool(j.args.get("force")),
+                                   log=lambda m: log("  " + str(m)))
+                r = r or {}
+                # render_all 的返回键是 rendered / skipped（没有 done）
+                note = (f"分镜图新出 {r.get('rendered', 0)} 张"
+                        f"（跳过 {r.get('skipped', 0)}，失败 {len(r.get('failed') or [])}）")
                 log(f"✅ [{j.id}] {label} — {note}")
             else:
                 raise ValueError(f"不支持的作业类型：{j.kind}")

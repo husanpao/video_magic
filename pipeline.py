@@ -72,43 +72,51 @@ def stage_plan(proj: Project, params: dict, *, only: list[str], force: bool, dry
                count: int = 0, on_tick=None, should_stop=None,
                chapter_sel: str | None = None) -> dict:
     plan_mod = taskctl.import_module("plan")
+    chapters_mod = taskctl.import_module("chapters")
     _need(plan_mod, "plan", "plan_chapter", "write_char_prompts")
-    # ── 多集/多章（2026-09-24）──────────────────────────────────────────────
-    # 原来这里写死 `chapter = chapters[0]`，并且提示"其余章节请分项目或手改镜头表" ——
-    # 也就是**多集从来不支持**。现在改成：遍历 novel/ 下全部章节，**每章一个镜头表文件**
-    # （`shots/chapter01.json` / `chapter02.json` …），`load_shots_dir` 会按文件名顺序合并，
-    # 所以逐镜渲染 / 质检 / 合成不需要任何改动就能跑多集。
-    #
-    # 角色卡是**跨章共享**的：第 2 章自动复用第 1 章已建的角色（`plan_chapter` 的 locked 机制），
+    # ── 多集/多章 ────────────────────────────────────────────────────────────
+    # 最早这里写死 `chapter = chapters[0]`（"其余章节请分项目"）—— 多集从来不支持。
+    # 2026-09-24 改成遍历 novel/ 全部章节、每章一个 `shots/chapterNN.json`，
+    # `load_shots_dir` 按文件名合并，所以渲染/质检/合成不用改就能跑多集。
+    # 角色卡**跨章共享**：第 2 章复用第 1 章已建的角色（`plan_chapter` 的 locked 机制），
     # 只对新出现的角色建卡 —— 这是"一集里角色形象统一"的前提。
-    chapters = sorted(proj.novel_dir.glob("*.md")) + sorted(proj.novel_dir.glob("*.txt"))
-    chapters = [c for c in chapters if not c.name.startswith(".")]
-    if not chapters:
+    #
+    # ★ 但"遍历 novel/ 全部章节"的顺序一直是 `sorted(glob)` —— 按 Unicode 码位排中文文件名，
+    # 实测《第一章/第二章/第三章》排成「一,三,二」，于是 `--chapter 3` 拆到的不是第三章。
+    # 现在章的顺序与章号**一律取自 chapters.json 清单**（P0.1，见 vm/chapters.py）。
+    targets = chapters_mod.plan_targets(proj)
+    if not targets:
         raise taskctl.TaskError(f"novel/ 下没有章节文件（.md/.txt）：{proj.novel_dir}")
-    # `--chapter N` 只拆第 N 章（按文件名排序的第 N 个，1-based）
+    # plan_targets 给的是 [(章号, 正文), ...]；这里反过来按**正文**建索引，
+    # 因为循环里手上拿的是文件路径。dict(targets) 直接建会得到 {章号: 正文} —— 方向反了。
+    ch_of = {p: n for n, p in targets}
+    # `--chapter N`：N 是**章号**，不再是"从前数第 N 个文件"。
+    # 这一字之差就是本项修复的全部内容 —— 旧语义下「第 3 章」和「第 3 个文件」是两回事。
     if chapter_sel:
         try:
-            idx = int(chapter_sel) - 1
+            want = int(chapter_sel)
         except (TypeError, ValueError):
-            raise taskctl.TaskError(f"--chapter 要给数字（第几章），收到 {chapter_sel!r}") from None
-        if idx < 0 or idx >= len(chapters):
+            raise taskctl.TaskError(f"--chapter 要给章号（第几章），收到 {chapter_sel!r}") from None
+        if want not in set(ch_of.values()):
             raise taskctl.TaskError(
-                f"--chapter {chapter_sel} 超出范围：novel/ 下有 {len(chapters)} 个章节"
+                f"--chapter {chapter_sel}：项目里没有章号 {want} 的章节。"
+                f"现有章号：{', '.join(str(n) for n in sorted(set(ch_of.values())))}"
             )
-        todo = [chapters[idx]]
+        todo = [pth for pth, n in ch_of.items() if n == want]
     else:
-        todo = chapters
+        todo = list(ch_of)
 
     if dry:
         log(f"[dry-run] 会拆镜 {len(todo)} 章：" +
-            "、".join(c.name for c in todo) + f" → {proj.shots_dir}/ + {proj.prompts_dir}/char_*.txt")
-        return {"dry": True, "chapters": [str(c) for c in todo]}
+            "、".join(f"{pth.name}(第{ch_of[pth]}章)" for pth in todo) +
+            f" → {proj.shots_dir}/ + {proj.prompts_dir}/char_*.txt")
+        return {"dry": True, "chapters": [str(pth) for pth in todo]}
 
     all_shots = 0
     all_chars: dict = {}
     last_stats: dict = {}
     for i, chapter in enumerate(todo):
-        ch_no = plan_mod.chapter_number(chapter, params)
+        ch_no = ch_of[chapter]
         _hr(f"拆镜（{i + 1}/{len(todo)}）：{chapter.name} → chapter{ch_no:02d}.json")
         cfg = dict(params)
         cfg["llm"] = params.get("llm") or {}
@@ -128,12 +136,20 @@ def stage_plan(proj: Project, params: dict, *, only: list[str], force: bool, dry
 
 
 def stage_chars(proj: Project, params: dict, *, only: list[str], force: bool, dry: bool,
-                count: int = 0, on_tick=None, should_stop=None) -> dict:
+                count: int = 0, on_tick=None, should_stop=None,
+                chapter_sel: str | None = None) -> dict:
     chars_mod = taskctl.import_module("chars")
     _need(chars_mod, "chars", "gen_all_chars")
     prompts = sorted(proj.prompts_dir.glob("char_*.txt"))
     if not prompts:
         raise taskctl.TaskError(f"prompts/ 下没有角色提示词 char_*.txt：{proj.prompts_dir}")
+    ch_no: int | None = None
+    if chapter_sel:
+        try:
+            ch_no = int(chapter_sel)
+        except (TypeError, ValueError):
+            raise taskctl.TaskError(f"--chapter 要给章号（整数），收到 {chapter_sel!r}") from None
+        log(f"  ▶ 本章专属造型：只出第 {ch_no} 章登记过换装的角色")
     if only:
         log(f"只处理指定角色：{', '.join(only)}")
     if dry:
@@ -141,13 +157,15 @@ def stage_chars(proj: Project, params: dict, *, only: list[str], force: bool, dr
         return {"dry": True, "chars": len(only) or len(prompts)}
     _hr("角色定妆照")
     out = chars_mod.gen_all_chars(proj, params, force=force, only=only or None, log=log,
+                                  chapter=ch_no,
                                   on_tick=on_tick, should_stop=should_stop)
     log(f"✓ 定妆完成 {len(out)} 个：{sorted(out)}")
     return {"refs": len(out)}
 
 
 def stage_gacha(proj: Project, params: dict, *, only: list[str], force: bool, dry: bool,
-                count: int = 0, on_tick=None, should_stop=None) -> dict:
+                count: int = 0, on_tick=None, should_stop=None,
+                chapter_sel: str | None = None) -> dict:
     """
     抽卡：同一角色用不同 seed 出 N 张候选 → refs/_gacha/<角色>/seed*.png。
 
@@ -157,6 +175,18 @@ def stage_gacha(proj: Project, params: dict, *, only: list[str], force: bool, dr
     chars_mod = taskctl.import_module("chars")
     _need(chars_mod, "chars", "gen_candidates")
     n = int(count or taskctl.DEFAULT_GACHA_COUNT)
+    # P3.2：`--chapter N` 在这个阶段的意思是"出第 N 章的专属造型图"
+    from vm import chapters as _Ch
+    ch_no: int | None = None
+    if chapter_sel:
+        try:
+            ch_no = int(chapter_sel)
+        except (TypeError, ValueError):
+            raise taskctl.TaskError(f"--chapter 要给章号（整数），收到 {chapter_sel!r}") from None
+        known = {e.no for e in _Ch.load(proj)}
+        if known and ch_no not in known:
+            raise taskctl.TaskError(
+                f"--chapter {ch_no}：清单里没有这一章。现有章号：{', '.join(str(x) for x in sorted(known))}")
     if n < 1 or n > 24:
         raise taskctl.TaskError(f"抽卡张数要在 1~24 之间，收到 {n}")
     names = [f.stem[len("char_"):] for f in sorted(proj.prompts_dir.glob("char_*.txt"))]
@@ -177,6 +207,7 @@ def stage_gacha(proj: Project, params: dict, *, only: list[str], force: bool, dr
         log(f"[{i}/{len(names)}] {name}")
         try:
             out = chars_mod.gen_candidates(proj, name, params, n, log,
+                                           chapter=ch_no,
                                            on_tick=on_tick, should_stop=should_stop)
             done[name] = len(out)
         except Exception as e:
@@ -322,8 +353,9 @@ def run_one_stage(proj: Project, stage: str, params: dict, *, only, force, dry, 
         raise taskctl.TaskError(f"未知阶段：{stage}")
     kw: dict = dict(only=list(only or []), force=force, dry=dry, count=count,
                     on_tick=on_tick, should_stop=should_stop)
-    # 只有 plan 阶段认 chapter_sel（其它阶段按镜头表跑，章号由镜头表文件名体现）
-    if stage == "plan":
+    # plan：chapter_sel = 「只拆这一章」；chars/gacha：chapter_sel = 「出这一章的专属造型」。
+    # 同一个整数、两种语义，由各自阶段解释（见 _start 的注释）。
+    if stage in ("plan", "chars", "gacha"):
         kw["chapter_sel"] = chapter_sel
     return fn(proj, params, **kw) or {}
 
@@ -531,6 +563,39 @@ def cmd_list() -> int:
     return 0
 
 
+def cmd_new(args) -> int:
+    """`--new` 建项目。业务全在 `vm/proj.py`，这里只做参数与输出（CLI/Web 同一套控制层）。"""
+    from vm import proj as P
+
+    try:
+        res = P.create_project(args.new, title=args.title, source_type=args.source_type,
+                              logline=args.logline, style_preset=args.style_preset)
+    except taskctl.TaskError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 2
+    print(f"✓ {res['message']}  →  {res['path']}")
+    print(f"  下一步：{res['next']}")
+    ok_n = 0
+    for spec in args.add_chapter or []:
+        title, _, src = spec.partition("=")
+        src_p = Path(src or title)
+        title = title if _ else src_p.stem
+        if not src_p.is_file():
+            print(f"  ✗ 章节源文件不存在：{src_p}", file=sys.stderr)
+            continue
+        try:
+            r = P.save_chapter(res["project"], title=title,
+                               text=src_p.read_text(encoding="utf-8", errors="replace"))
+            ok_n += 1
+            print(f"  ✓ 第 {r['no']} 章《{r['title']}》（{r['chars']} 字）")
+        except taskctl.TaskError as e:
+            print(f"  ✗ 导入 {src_p.name} 失败：{e}", file=sys.stderr)
+    if args.add_chapter:
+        print(f"  已导入 {ok_n}/{len(args.add_chapter)} 章")
+    print(f"\n启动控制台：python3 pipeline.py {res['project']} --serve")
+    return 0
+
+
 def cmd_serve(project: str | None, port: int) -> int:
     from vm import web
 
@@ -562,12 +627,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--stage", choices=STAGES, help="要执行的阶段")
     p.add_argument("--only", default="", help="只处理这些镜头/角色，逗号分隔（对 render/chars/gacha 生效）")
     p.add_argument("--chapter", dest="chapter", default=None,
-                   help="只拆第 N 章（按 novel/ 文件名排序，1-based）。默认遍历全部章节，每章一个镜头表文件。")
+                   help="只拆指定**章号**的章节（章号取自 chapters.json 清单，"
+                        "即镜头表 chapterNN.json / 镜头 id 前缀里的那个 NN；不是"
+                        "「从前数第 N 个文件」—— 那是修复前的旧语义）。默认遍历全部章节。")
     p.add_argument("--count", type=int, default=0,
                    help=f"抽卡张数（仅 gacha 阶段；默认 {taskctl.DEFAULT_GACHA_COUNT}）")
     p.add_argument("--force", action="store_true", help="忽略指纹，强制重跑")
     p.add_argument("--dry-run", action="store_true", help="只说要做什么，不真跑")
     p.add_argument("--list", action="store_true", help="列出所有项目")
+    # P1 正门：以前**没有任何**建项目的入口（README 靠手工 mkdir + cp）
+    p.add_argument("--new", metavar="项目名", default=None,
+                   help="新建项目（建目录 + project_meta.json + 空章节清单）。"
+                        "已存在则拒绝，不会清空重建。")
+    p.add_argument("--title", default="", help="配合 --new：项目显示名（默认同项目名）")
+    p.add_argument("--source-type", dest="source_type", default="novel",
+                   choices=["novel", "script"], help="配合 --new：来源类型（默认 novel）")
+    p.add_argument("--logline", default="", help="配合 --new：一句话题材")
+    p.add_argument("--style", dest="style_preset", default="auto",
+                   choices=["auto", "realistic", "cg", "anime"],
+                   help="配合 --new：整本小说级的画面风格预设（默认 auto = 拆镜前由通读登记推荐）")
+    p.add_argument("--add-chapter", dest="add_chapter", action="append", default=[],
+                   metavar="标题=正文文件", help="配合 --new：直接导入章节文件，可重复")
     p.add_argument("--serve", action="store_true", help="启动极简 Web UI")
     p.add_argument("--port", type=int, default=8801, help="Web UI 端口（默认 8801）")
     # 内部参数：由 taskctl 派生 worker 时使用；正常用户不需要碰
@@ -582,6 +662,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.list:
         return cmd_list()
+
+    if args.new:
+        return cmd_new(args)
 
     if args._worker:
         if not args.project:
@@ -598,7 +681,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.project:
         build_parser().print_help()
-        print("\n✗ 需要项目名，或用 --list / --serve", file=sys.stderr)
+        print("\n✗ 需要项目名，或用 --list / --new / --serve", file=sys.stderr)
         return 2
     if not args.stage:
         print(f"✗ 需要 --stage {'|'.join(STAGES)}（或 --serve）", file=sys.stderr)
@@ -617,6 +700,9 @@ def main(argv: list[str] | None = None) -> int:
             dry=args.dry_run,
             fake_sleep=args._fake_sleep,
             count=args.count,
+            # ★ P0.3：前台 CLI 入口以前**丢掉了** `--chapter` —— 参数在 build_parser
+            # 里定义了、worker 也认，但这条转发链没传，所以 `--chapter 2` 实际会拆全部章。
+            chapter=args.chapter,
         )
     except taskctl.TaskBusy as e:
         print(f"✗ {e}", file=sys.stderr)

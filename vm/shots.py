@@ -35,6 +35,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from . import fsutil
 from typing import Any, Iterable
 
 # ── 帧网格与时长域（与 CONTRACTS.md 冻结值一致）──────────────────────────────
@@ -533,14 +534,8 @@ def _coerce_costume(raw: Any) -> dict[str, str]:
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
-    """先写 .tmp 再 os.replace，避免掉电/被杀留下半个 JSON（与 state.py 同一策略）。"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    """原子写文本（镜头表 JSON 文本）。实现已收敛到 `vm/fsutil.py`。"""
+    fsutil.write_text(path, text)
 
 
 def dumps_shots(shots: Iterable[Shot]) -> str:

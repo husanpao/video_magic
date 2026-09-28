@@ -165,6 +165,28 @@ class TestErrorRouting(HttpContractTest):
             self.assertEqual(code, 404, f"{method} {path}")
             self.assertEqual(b["error"], "not_found")
 
+    def test_wrong_method_is_405_not_404(self):
+        """路径存在但方法用反 ⇒ 405 + 说清该用哪个方法。
+
+        真事：有人拿 GET 去访问 POST-only 的 `/api/project/create`，旧实现回的是
+        "没有这个路径"—— 于是一路去查路由表、怀疑服务没重启，而真因只是方法不对。
+        报错文案把 A 说成 B，比报错本身更贵。
+        """
+        code, b = self.get("/api/project/create")
+        self.assertEqual(code, 405, f"POST-only 端点被 GET 访问应是 405：{b}")
+        self.assertEqual(b["error"], "wrong_method")
+        self.assertIn("POST", b["message"], b["message"])
+
+        code, b = self.post("/api/status", body={})
+        self.assertEqual(code, 405, f"GET-only 端点被 POST 访问应是 405：{b}")
+        self.assertEqual(b["error"], "wrong_method")
+        self.assertIn("GET", b["message"], b["message"])
+
+        # 前缀路由（/assets/ 走 GET 的 page_asset）也不能被 POST 蒙混成"没有这个路径"
+        code, b = self.post("/assets/whatever.png", body={})
+        self.assertEqual(code, 405, f"/assets/ 是 GET 前缀路由：{b}")
+        self.assertEqual(b["error"], "wrong_method")
+
     def test_bad_json_body_is_400(self):
         code, b = self.post("/api/run", raw="{不是 json".encode("utf-8"))
         self.assertEqual(code, 400, f"坏 JSON 是请求错误不是服务端故障：{b}")

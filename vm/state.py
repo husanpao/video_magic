@@ -33,6 +33,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from vm import fsutil
 from typing import Any, Iterable
 
 MANIFEST_VERSION = 1
@@ -44,14 +45,11 @@ CURRENT = "current"
 
 
 def _atomic_write_json(path: Path, data: Any) -> None:
-    """先写临时文件再 rename，保证不会出现半截 JSON。"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    """原子写 JSON。实现已收敛到 `vm/fsutil.py`（唯一真相）。
+
+    保留这个薄壳是为了不动本模块的调用点 —— 收敛的验收标准是"行为逐字节不变"。
+    """
+    fsutil.write_json(path, data, sort_keys=True, trailing_newline=False)
 
 
 def ref_stamp(path: Path) -> str:
@@ -329,6 +327,22 @@ class Checkpoint:
 
 class Project:
     """一个项目的目录约定与状态载体。"""
+
+    @classmethod
+    def of(cls, proj: "Project | Path | str") -> "Project":
+        """
+        把 `Project` / `Path` / `str` 统一成 `Project`。
+
+        ★ 不要用 `hasattr(proj, "root")` 做这个判断 ——
+        **`pathlib.Path` 自己就有 `.root`**（绝对路径的是 `'/'`），
+        于是 `Path("projects/x")` 会被判成"已经是 Project 了"，
+        随后 `proj.root` 拿到 `'/'`，产物直接往文件系统根目录写。
+        这个写法曾在 `vm/assets.py` 里复制了三份（158/207/355）。
+        """
+        if isinstance(proj, Project):
+            return proj
+        root = getattr(proj, "root", None) if not isinstance(proj, (str, Path)) else None
+        return cls(Path(root) if root is not None else Path(proj))
 
     def __init__(self, root: Path):
         self.root = Path(root)

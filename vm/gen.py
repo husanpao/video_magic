@@ -325,21 +325,15 @@ def _ref_names_for(proj: Project, shot: Shot) -> list[str]:
       导致 subject_definitions 里的角色与画面里的图整体错位，
       而画面还能正常出（只是人不对），是最难查的一类 bug。
       缺图必须显式报错。
+
+    解析规则本身在 `vm/refs.py`（P3.2）：`章内专属定妆照 > 全局默认`。
+    ★ 这里与下面 `render_shot()` 算指纹用的 `ref_paths` **必须走同一个出口** ——
+      两处各算一份的话，迟早会出现"图换了但指纹没变 → 不重渲"，
+      或"图没变却判 stale → 白烧 GPU"。风格后缀那件事上刚踩过同型错误。
     """
-    names: list[str] = []
-    missing: list[str] = []
-    for c in shot.chars:
-        p = proj.refs_dir / f"char_{c}.png"
-        if p.exists():
-            names.append(p.name)
-        else:
-            missing.append(c)
-    if missing:
-        raise ComfyError(
-            f"镜头 {shot.id} 的角色 {missing} 缺少参考图（refs/char_<名>.png）"
-            f"；参考图顺序必须与 chars 一一对应，不能缺项。请先跑 chars 阶段生成定妆照。"
-        )
-    return names
+    from vm import refs as _R
+
+    return [path.name for path, _src in _R.require_refs(proj, shot.chars, shot.id)]
 
 
 def render_shot(
@@ -364,7 +358,9 @@ def render_shot(
     clip = proj.clip(shot.id)
     # A2：帧数按「人工覆盖 ?? 规划值」算，而不是裸 shot.sec
     frames = seconds_to_frames(effective_sec(shot), int(_p(params, "fps")))
-    ref_paths = [proj.refs_dir / f"char_{c}.png" for c in shot.chars]
+    # 与 `_ref_names_for`（实际提交的那批图）**同源**：见 vm/refs.py 模块头
+    from vm import refs as _R
+    ref_paths = _R.ref_paths(proj, shot.chars, shot.id)
     fp = shot_fingerprint(
         shot.prompt, shot.chars, ref_paths, params, frames, shot.seed
     )

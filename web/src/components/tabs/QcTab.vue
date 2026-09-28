@@ -30,7 +30,7 @@
         <span class="small">{{ when }}</span>
       </template>
     </div>
-    <div class="tabbody flush">
+    <div class="tabbody flush" data-testid="qc-rows">
       <template v-if="!err && state.qc.has_result">
         <div class="hintline qchint">
           判据：末尾 25% 窗口内相邻帧的<b>逐像素绝对差</b>均值（2026-09-23 修正）。

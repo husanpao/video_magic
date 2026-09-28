@@ -86,13 +86,16 @@ import { ElMessage } from 'element-plus'
 import { api } from '@/api/client'
 import { refreshQueue, state } from '@/stores/app'
 import { confirmAction } from '@/composables/confirmAction'
+import { every, useClock } from '@/composables/useTicker'
 
 const expanded = ref(false)
-const now = ref(Date.now())
-const timer = window.setInterval(() => { now.value = Date.now() }, 1000)
-// 队列状态每 3 秒拉一次 —— 别跟主轮询（2s）挤在一起
-const poll = window.setInterval(() => { void refreshQueue() }, 3000)
-onUnmounted(() => { window.clearInterval(timer); window.clearInterval(poll) })
+// F0.2：这两个以前是各自 1 个 setInterval（共 3 个定时器中的 2 个），
+// 现在都挂到全局唯一心跳上。
+// ★ 队列轮询**不能**按"面板是否展开"来 skip —— 收起时那颗徽标照样在显示排队数，
+//   省请求的代价是数字变陈旧。
+const now = useClock(1000)
+const offQueuePoll = every(3000, () => refreshQueue())
+onUnmounted(offQueuePoll)
 
 const CN: Record<string, string> = {
   pending: '排队', running: '进行中', done: '完成', failed: '失败', canceled: '已取消',
@@ -134,7 +137,7 @@ const btnLabel = computed(() => {
 async function cancel(id: string) {
   try {
     const r = await api.queueCancel(state.project, id)
-    ElMessage.success((r.message as string) || '已取消')
+    ElMessage.success(r.message || '已取消')
     await refreshQueue()
   } catch (e) {
     ElMessage.error((e as Error).message)
@@ -161,7 +164,7 @@ async function onStop() {
   if (!ok) return
   try {
     const r = await api.stop(state.project)
-    ElMessage.success((r.message as string) || '已停止')
+    ElMessage.success(r.message || '已停止')
   } catch (e) {
     ElMessage.error((e as Error).message)
   }

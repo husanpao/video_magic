@@ -51,9 +51,9 @@ final/EP01.mp4
 | **每镜的提示词** | 镜头表 → 编辑 | 六段式（主体/动作/运镜/光影/音景/配乐），改完该镜变「需重渲」 |
 | **角色长什么样** | 角色定妆 tab | 改定妆提示词，或**上传你自己的图** |
 | **角色的服装变体** | 角色定妆 tab | 同一角色可有多套服装，按镜切换 |
-| **场景是什么样** | 场景 tab | 改场景描述（它会逐字注入该场景每一镜），或传自己的概念图 |
-| **道具长什么样** | 道具 tab | 同上 |
-| **画面风格** | `project.json` | `realistic` 写实电影感 / `cg` 半写实 3D 建模 / `anime` 日式二维动画 |
+| **场景是什么样** | 「场景与道具」tab | 改场景描述（它会逐字注入该场景每一镜），或传自己的概念图 |
+| **道具长什么样** | 「场景与道具」tab（与场景同一屏） | 同上 |
+| **画面风格** | 「风格」屏（整本小说一份） | `realistic` 写实电影感 / `cg` 半写实 3D 建模 / `anime` 日式二维动画。首次拆镜前系统会读整本**自动推荐**并给理由，你可改；改之前会先摊开影响清单（哪些图要重出、要不要重跑拆镜） |
 
 ![角色定妆](docs/images/char-linyue.png)
 
@@ -93,6 +93,10 @@ final/EP01.mp4
 
 - **分段进度条**：每一段宽度 ∝ 该镜实际时长，颜色标质检状态。
   它同时是进度条、时长分布图、和点击跳转的导航。
+  ★ 一集一章：播 EP02 时条上只有第二章的镜头，不会把全片画进去。
+- **审片屏（顶栏「成片」）**：播放器占主区，右边同屏挂着质检 + 审计两张清单 ——
+  **点一条问题直接把播放头跳到那一镜**（问题在另一集时会先自动切集）。
+  以前这三样在右栏三个互斥的 tab 里，看到问题要切 tab 找行再切回来。
 - **胶片条**：通览全片，缺哪段一眼看到。
 - **质检 tab**：硬故障的镜头**默认不会进成片**，会被列出来让你决定重渲还是忽略。
 - **成本护栏**：渲染前告诉你"这一步要花 22 分钟 GPU / 8500 tokens"，
@@ -108,11 +112,25 @@ final/EP01.mp4
 git clone <repo> && cd video_magic
 cd web && npm install && npm run build:only && cd ..
 
-mkdir -p projects/我的剧/novel
-cp 第一章.md projects/我的剧/novel/
+# 建项目（也可以在界面上点「➕ 新建项目」）
+python3 pipeline.py --new 我的剧 --title "我的剧" --logline "一句话题材"
 python3 pipeline.py 我的剧 --serve --port 8801
-# → http://127.0.0.1:8801/   点「全链」
+# → http://127.0.0.1:8801/   顶部「章节」里导入 .md/.txt 或粘贴正文 → 「风格」确认 → 点「拆镜」
+
+# 或者用启停脚本管这个服务（status 是默认动作）
+./serve.sh restart 我的剧      # start / stop / restart / status / logs [-f]
 ```
+
+`serve.sh` 的取舍写死在代码里，不靠"记得小心点"：只按**端口 → pid → 核 `/proc/<pid>/cmdline`**
+找目标（绝不用 `pgrep -f`/`pkill -f`，那会连自己的命令行一起匹配上），
+cmdline 不像本控制台就**拒绝动手**，`8188` 是硬禁区（**绝不启停 ComfyUI**），
+停服务只用 `SIGTERM`，超时会停下来让人看而不是补 `KILL`。
+
+以前这里写的是 `mkdir -p projects/我的剧/novel` + `cp 第一章.md`：
+后台**没有任何"新建项目"的入口**，章节只能靠手工往目录里丢文件。
+现在项目与章节都有正门（界面 + CLI），改完一章还能只重拆那一章，不必全书重跑。
+项目卡的「删除」也不是 `rm`：会要求手输项目名，再把整部片子移进 `projects/_trash/`；
+回收站能在同一屏恢复，重名时系统拒绝覆盖。
 
 **前置**：ComfyUI 常驻运行（默认 `127.0.0.1:8188`，本项目不会启停它）、
 ffmpeg、Python 3.10+、Node 18+、DeepSeek API key
@@ -165,16 +183,23 @@ models/vae/               qwen_image_2.1_vae_bf16.safetensors
 <summary>项目结构</summary>
 
 ```
-pipeline.py          阶段入口
+pipeline.py          阶段入口（也是 worker 执行体）；--new 建项目、--chapter N 只拆那一章
+serve.sh             控制台（web 服务）启停：start / stop / restart / status / logs
 vm/
-  plan.py            ① 拆镜：章节 → 镜头表 + 角色卡 + 场景 + 道具 + 风格句
+  proj.py            项目与章节管理（新建项目、章节增删改排序、导入、可逆删除）
+  chapters.py        章节清单 chapters.json（"有哪些章、什么顺序"的唯一真相）
+  register.py        整本小说级的风格确定（通读推荐 + 人工确认 + 影响清单）
+  imgfp.py           定妆照/概念图的出图指纹（改风格能被认出来）
+  refs.py            参考图解析的唯一出口（`chars[0] ↔ ref_image_0 ↔ <Picture 1>` 顺序契约 + 章节专属造型变体）
+  fsutil.py          原子写的唯一实现
+  plan.py            ① 拆镜：章节 → 镜头表 + 角色卡 + 场景 + 道具（跨章累积登记）
   chars.py           ② 定妆 + 抽卡
   gen.py             ③ 逐镜渲染
   qc.py              ④ 质检
   assemble.py        ⑤ 合成 + 字幕
   script.py          剧本视图（由镜头表推导，零 token）+ 台词无损校验
   storyboard.py      分镜图
-  qi.py / style.py   Qwen-Image 客户端 / 画面风格预设
+  qi.py / style.py   Qwen-Image 客户端 / 画面风格预设（含**真正进图**的风格后缀）
   budget.py          成本护栏 + 台账
   queue.py           作业队列
   wsclient.py        极简 WebSocket 客户端（读 ComfyUI 步级进度）
@@ -183,6 +208,7 @@ vm/
   web.py             HTTP API + 前端托管
   audit/             节奏 / 台词覆盖 / 台词保真 / 完备性矩阵
 web/                 Vue 3 + Vite + Element Plus 控制台
+                     五个工作区（= 流程本身）：项目 → 章节 → 风格 → 镜头工作台（默认落地屏）→ 成片与审片
 docs/prompts/        发给 LLM 的全部提示词
 projects/            你的片子（**不提交**）
 ```
@@ -221,13 +247,21 @@ python3 -m vm.audit.cli  我的剧                                     # 节奏/
 <summary>测试</summary>
 
 ```bash
-cd web && node ui-e2e.mjs          # 真浏览器 E2E（Playwright + Chromium）
-FAST=1 node ui-e2e.mjs             # 冒烟
+python3 -m unittest discover -s vm/tests -q         # 后端 209 项（含审计层之外的全部）
 python3 -m unittest discover -s vm/audit/tests -q   # 审计层 66 项
+
+# 真浏览器 E2E（Playwright + Chromium）——★ 必须先起**夹具服务器**并显式指过去：
+python3 -m vm.tests.e2e_fixture --serve --port 8899     # 另一个终端
+VM_BASE=http://127.0.0.1:8899 node web/ui-e2e.mjs
+FAST=1 VM_BASE=http://127.0.0.1:8899 node web/ui-e2e.mjs   # 冒烟
 ```
 
 E2E 用**真浏览器**而非 DOM 桩 —— `vue-tsc` 和 `vite build` 全绿但界面不显示的情况，
 本项目遇到过多次。
+
+★ 忘了 `VM_BASE` 会连到默认端口 8801 上那个**真实数据**的服务：那边没有合成夹具，
+后端对未知项目回的是"200 + 空表"，于是一片假红 + 几条空过的互证断言。
+现在 E2E 开跑先核对目标服务器上夹具真有 6 镜，不是就直接退出并打印正确跑法。
 
 </details>
 
@@ -235,9 +269,17 @@ E2E 用**真浏览器**而非 DOM 桩 —— `vue-tsc` 和 `vite build` 全绿�
 
 ## 已知局限
 
-- **画面风格由参考图决定，文字控不住画风。** 想要二次元或建模风，必须让定妆照本身
-  是那个风格 —— 改提示词里的风格句没用。这是实测出来的（同一提示词，只换参考图，
-  整张图的画风跟着变）。
+- **画面风格：文字控不住*视频*，但控得住*定妆照*。** 这条以前写的是"改提示词里的风格句没用"，
+  现在实测厘清了机制：H3 渲染出来的画风由**参考图**决定，而参考图（定妆照/概念图）本身
+  是 Qwen-Image 出的 —— **给图像模型的风格后缀真的会改变出图**
+  （同提示词同 seed，只换 `style_preset`，在 Qwen-Image **2.1** 上：realistic 饱和度 10.2 / 亮度 67.3
+  ↔ anime 饱和度 33.1 / 亮度 89.8，照片级 ↔ 赛璐璐平涂，肉眼一眼可辨）。
+  所以换风格的**正确做法**是：改「风格」屏 → 按新风格**重出定妆照与概念图** → 再渲染。
+  只改风格句而不重出图，画面确实不会变（那半句以前是死代码，现已接上）。
+- **改风格不会让已有镜头自动失效。** 风格句是在*拆镜那一刻*被逐字烘进每一镜提示词的，
+  所以改完风格，旧镜头仍带旧句。要让新风格进到画面必须**重跑拆镜**，
+  而那会让**全部镜头重渲**（实测 52 镜约 36 分钟 GPU）—— 这是「风格应当在拆镜之前就定好」的原因，
+  「风格」屏也会在保存前把这笔代价摊给你看。
 - **分镜图与成片构图不保证一致**（两个不同模型出的）。
 - **连续性（跨镜动作衔接）未做。** 实测观感可接受，暂不投入。
 - **单镜上限 20.75 秒**（受帧数网格限制）。

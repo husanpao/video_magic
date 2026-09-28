@@ -333,7 +333,7 @@ const onSave = () => withBusy(async () => {
     undo: () => api.updateShot(state.project, s.id, before),
     redo: () => api.updateShot(state.project, s.id, p),
   })
-  ElMessage.success((r.message as string) || '已保存（标为待重渲）')
+  ElMessage.success(r.message || '已保存（标为待重渲）')
   await load()
   await refreshAfterEdit()
 })
@@ -365,7 +365,7 @@ const onRewrite = () => withBusy(async () => {
     undo: () => api.updateShot(state.project, s.id, { prompt: beforePrompt }),
     redo: () => api.updateShot(state.project, s.id, { prompt: afterPrompt }),
   })
-  ElMessage.success((r.message as string) || '已重写')
+  ElMessage.success(r.message || '已重写')
   await refreshAfterEdit()
 })
 const onSplit = () => withBusy(async () => {
@@ -389,7 +389,7 @@ const onSplit = () => withBusy(async () => {
     },
     redo: () => api.splitShot(state.project, s.id, at),
   })
-  ElMessage.success((r.message as string) || '已拆分')
+  ElMessage.success(r.message || '已拆分')
   await load()
   await refreshAfterEdit()
 })
@@ -418,7 +418,7 @@ const onMerge = () => withBusy(async () => {
     },
     redo: () => api.mergeShot(state.project, s.id),
   })
-  ElMessage.success((r.message as string) || '已与下一镜合并')
+  ElMessage.success(r.message || '已与下一镜合并')
   await load()
   await refreshAfterEdit()
 })
@@ -436,7 +436,7 @@ const onInsert = () => withBusy(async () => {
       redo: () => api.insertShot(state.project, s.id, item || undefined),
     })
   }
-  ElMessage.success((r.message as string) || '已在后面插入新镜')
+  ElMessage.success(r.message || '已在后面插入新镜')
   await load()
   await refreshAfterEdit()
 })

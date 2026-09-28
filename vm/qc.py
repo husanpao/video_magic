@@ -57,6 +57,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from . import fsutil
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # 只为类型注解，运行时不 import
@@ -122,18 +123,13 @@ class QCResult:
 
 
 def _atomic_write_json(path: Path, data) -> None:
-    """先写 .tmp 再 os.replace，避免掉电/被杀留下半截 JSON。
+    """原子写 JSON。实现已收敛到 `vm/fsutil.py`（唯一真相）。
 
-    这里刻意复制 state.py 的同名私有函数（而不是 import 下划线名字）：
-    私有函数跨模块引用会让重构互相牵连，10 行代码不值得那个耦合。
+    这里原先的理由是"10 行代码不值得跨模块耦合"—— 代价是 `chars.py:85` 记录的那类
+    事故（漏 `mkdir(parents=True)` 导致 `os.replace` 报 FileNotFoundError）在 21 个落点上
+    各有一次机会。耦合的正是它该在的地方：一个零依赖的工具模块。
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    fsutil.write_json(path, data, sort_keys=True, trailing_newline=False)
 
 
 def _which(tool: str) -> str:

@@ -9,16 +9,22 @@
     <button class="errx" title="知道了（关闭错误条）" @click="clearError">✕</button>
   </div>
 
-  <div class="workbench">
-    <FilterRail />
-    <ShotNav />
-    <ShotTable />
-    <RightPanel />
-  </div>
-  <Filmstrip />
-  <ShotModal />
+  <!-- 工作区（F1.1）。KeepAlive 让切屏不丢各屏自己的状态：
+       工作台要保住滚动位置与选中镜，章节屏要保住正在编辑但没保存的草稿。 -->
+  <router-view v-slot="{ Component }">
+    <keep-alive :max="4">
+      <component :is="Component" :key="$route.name" />
+    </keep-alive>
+  </router-view>
+
+  <!-- 队列浮层 / 主题与抽屉开关属于**壳**：在任何一屏跑任务都要能看到进度与停止 -->
   <QueueFab />
   <UiToggles />
+
+  <!-- 镜头详情弹层也在壳里（W4 实锤）：它原来挂在 WorkbenchView 内，
+       于是在审片屏点质检行的「详情」什么也不发生 —— KeepAlive 把工作台摘下来时
+       组件不再渲染，el-dialog 根本没被创建。任何一屏点开一镜都要有它。 -->
+  <ShotModal />
 
   <!-- `?` 快捷键帮助浮层（U5）。内容就是 useHotkeys 里的 HOTKEYS 表 ——
        帮助永远和真实绑定同源，不会"文档说有、实际没绑"。 -->
@@ -41,23 +47,19 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, watch } from 'vue'
 import TopBar from '@/components/TopBar.vue'
-import FilterRail from '@/components/FilterRail.vue'
-import ShotNav from '@/components/ShotNav.vue'
-import ShotTable from '@/components/ShotTable.vue'
-import RightPanel from '@/components/RightPanel.vue'
-import Filmstrip from '@/components/Filmstrip.vue'
-import ShotModal from '@/components/ShotModal.vue'
 import QueueFab from '@/components/QueueFab.vue'
 import UiToggles from '@/components/UiToggles.vue'
+import ShotModal from '@/components/ShotModal.vue'
 import { HOTKEYS, helpOpen, useHotkeys } from '@/composables/useHotkeys'
+import { every } from '@/composables/useTicker'
+import { refreshTab } from '@/stores/refresh'
 import {
   clearError, clearRenderHints, clearTransient, errText, loadProjects, pullLog, refreshAll,
-  refreshAssets, refreshChapters, refreshChars, refreshCompleteness, refreshProps, refreshQueue,
-  refreshQc, refreshAudit, refreshScript, refreshScenes, refreshShots, refreshStatus,
-  refreshStoryboard, setError, state,
+  refreshAssets, refreshChapters, refreshQueue, refreshScenes,
+  refreshScript, refreshShots, refreshStatus, refreshStoryboard, resetProjectScoped, setError, state,
 } from '@/stores/app'
 
-let timer = 0
+let offTick: (() => void) | null = null
 let lastShotsAt = 0
 let lastTabAt = 0
 let wasRunning = false
@@ -66,29 +68,13 @@ let wasRunning = false
 useHotkeys()
 
 /**
- * 各 tab 对应的数据刷新器。
- *
  * ★ 设计目标：**不要死页面**（2026-09-24，用户明确要求）。
  * 之前只有「日志 + 顶栏进度」在轮询，右栏所有 tab 都只在**切换 tab 那一刻**刷新 ——
  * 于是你盯着「质检」tab 时跑完质检，界面上什么都不会变。
+ *
+ * tab → 数据源那张表搬到了 `stores/refresh.ts`（全仓库唯一一份），
+ * 这里和 RightPanel 都用 `refreshTab()`，不会再出现"轮询表里有、切换表里漏"。
  */
-const TAB_REFRESH: Record<string, () => Promise<void>> = {
-  chars: refreshChars,
-  script: refreshScript,
-  scenes: refreshScenes,
-  props: refreshProps,
-  storyboard: refreshStoryboard,
-  qc: refreshQc,
-  audit: refreshAudit,
-  completeness: refreshCompleteness,
-}
-
-async function refreshActiveTab(): Promise<void> {
-  const fn = TAB_REFRESH[state.tab]
-  if (!fn) return
-  // refresh* 内部已统一 guard（失败回落 + 界面报错），这里不会再抛
-  await fn()
-}
 
 /**
  * 每 2 秒轮询。**运行中要让所有会变的地方都跟着走。**
@@ -113,11 +99,11 @@ async function tick(): Promise<void> {
     }
     if (state.running && now - lastTabAt > 4000) {
       lastTabAt = now
-      await refreshActiveTab()
+      await refreshTab(state.tab)
     }
     if (!state.running && now - lastTabAt > 15000) {
       lastTabAt = now
-      await refreshActiveTab()
+      await refreshTab(state.tab)
     }
 
     if (wasRunning && !state.running) {
@@ -145,10 +131,12 @@ onMounted(async () => {
   await refreshAssets()
   await refreshQueue()
   await refreshShots()
-  timer = window.setInterval(() => { void tick() }, 2000)
+  // F0.2：不再自己 setInterval —— 挂到全控制台唯一的心跳上（见 composables/useTicker.ts）。
+  // 注册当拍不发请求，首拉由上面这一串显式调用完成，与拆分前行为一致。
+  offTick = every(2000, tick)
 })
 
-onUnmounted(() => window.clearInterval(timer))
+onUnmounted(() => { offTick?.(); offTick = null })
 
 // ★ 切项目必须**同步清空**所有项目级状态（2026-09-24 修）。
 // 原来只清了 shotsLoaded / selected / logText，结果切到新项目的那一瞬间：
@@ -158,26 +146,12 @@ onUnmounted(() => window.clearInterval(timer))
 watch(
   () => state.project,
   async (p) => {
-    if (!p) return
-    // 先同步清空（不要 await，否则清空前的旧渲染还在）
-    state.shots = []
-    state.counts = { total: 0, current: 0, stale: 0, missing: 0, qc_fail: 0 }
-    state.shotsLoaded = false
-    state.selected = ''
-    state.logText = ''
-    state.chapters = []
-    state.chapter = null
-    state.scripts = []
-    state.scenes = []
-    state.props = []
-    state.storyboard = []
-    state.assets = []
-    state.chars = []
-    state.qc = { results: {}, counts: { pass: 0, suspicious: 0 }, review: [], rerender: [], has_result: false, generated_at: 0 }
-    state.audit = null
-    state.final = null
-    // 多选 / 撤销栈 / 乐观标记都指向旧项目，一起清（clearTransient）
+    // 删掉**最后一个**当前项目时 p 会变成空串：也必须先清旧项目数据，
+    // 否则再进工作台会看到已经移进回收站的镜头表（ProjectsView 的删除操作真实会走到这里）。
+    // refresh* 才需要项目名，所以只把 return 放在复位之后。
+    resetProjectScoped()
     clearTransient()
+    if (!p) return
     await refreshStatus()
     await refreshChapters()
     await refreshScript()

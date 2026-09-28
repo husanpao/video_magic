@@ -58,6 +58,7 @@ import re
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
+from vm import fsutil
 from typing import Any
 from urllib.parse import urlparse
 
@@ -233,6 +234,24 @@ SCHEMA: tuple[Item, ...] = (
         effect="调高拆镜更跳、台词改写风险更大；本项目纪律是「不压缩」，建议保持 0.3 附近。",
         stale="不进镜头指纹；下次拆镜才生效。",
         minimum=0.0, maximum=2.0,
+    ),
+    _it(
+        "plan.allow_new_characters", "模型", "拆镜时允许新建角色卡", "bool", None,
+        what="拆镜过程中发现「正文里有名字、但还没有角色卡」的角色时，是否当场为他建卡"
+             "（阶段⓪抽卡 + 用到的当场补卡）。**留空 = 默认允许**（名字必须真的出现在正文里，"
+             "且总数不超过上限，防幻觉）。",
+        effect="关掉它、项目又没有角色卡时，每个有名字的角色都会被判「没卡」，拆镜必然失败 —— "
+               "所以只有当你已经手工建好全部角色卡时才建议显式关掉（防 LLM 加戏）。",
+        stale="不进镜头指纹；对已拆好的镜头表无影响，下次拆镜生效。",
+        nullable=True, placeholder="留空 = 自动（没有角色卡时开启）",
+    ),
+    _it(
+        "llm.max_tokens", "模型", "LLM 单次输出上限（max_tokens）", "int", None,
+        what="拆镜/改写时单次回复的最大 token 数。**留空 = 内置 8192**（deepseek-chat 的上限）。",
+        effect="报「LLM 输出被 max_tokens 截断」时调大（章节长、镜头多时容易顶到）；"
+               "只在你的模型支持更大输出时有效 —— 填超过接口上限会被直接拒绝。",
+        stale="不进镜头指纹；下次拆镜/改写生效。",
+        nullable=True, minimum=1024, maximum=131072,
     ),
     _it(
         "vae_video", "模型", "视频 VAE", "str", "minimax_h3_video_vae_fp16.safetensors",
@@ -422,14 +441,11 @@ def _read_json(path: Path) -> dict:
 
 
 def _atomic_write_json(path: Path, data: Any) -> None:
-    """原子写（CONTRACTS 硬约束 3）：.tmp + os.replace，掉电不留半截 JSON。"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    """原子写 JSON。实现已收敛到 `vm/fsutil.py`（唯一真相）。
+
+    保留这个薄壳是为了不动本模块的调用点 —— 收敛的验收标准是"行为逐字节不变"。
+    """
+    fsutil.write_json(path, data, sort_keys=True, trailing_newline=False)
 
 
 def _dig_get(d: Any, dotted: str) -> Any:
@@ -796,7 +812,13 @@ def impact_of(proposed: dict[str, Any], *, project: str | os.PathLike[str] | Non
     for s in shots:
         sid = str(getattr(s, "id", "") or "")
         chars = list(getattr(s, "chars", []) or [])
-        refs = [proj.refs_dir / f"char_{c}.png" for c in chars]
+        # ★ 不能在这里自己拼 `char_<名>.png`：那是**第三处**独立解析参考图的代码，
+        # 它一旦不知道"第 N 章用专属图"（P3.2），本函数预测的 stale 集合就会算错 ——
+        # 后果是"改了配置界面说这些镜要重渲，其实不用"或反过来。
+        # 解析器只有一个：vm/refs.py（与 gen.py 实际提交的同源）。
+        from vm import refs as _R
+        refs = [path for path, _src in _R.refs_for_shot(proj, chars, sid)
+                if path is not None]
         seed = int(getattr(s, "seed", 0) or 0)
         prompt = str(getattr(s, "prompt", "") or "")
         fp_old = shot_fingerprint(prompt, chars, refs, params_old, _frames(s, cur), seed)

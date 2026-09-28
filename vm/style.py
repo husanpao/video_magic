@@ -210,6 +210,64 @@ def resolve_preset(value: object) -> str:
     return DEFAULT_PRESET
 
 
+def preset_of(params: object) -> str:
+    """
+    从一份配置里取**当前生效的风格预设** —— 全仓库唯一的口径。
+
+    ★ 为什么要有这个函数：以前有 5 处各写一遍的读法，行为还不一样：
+      · `plan._preset_of` 读 `style_preset`，空则回落 `style`（拆镜路径，唯一写对的）
+      · `chars.py` / `assets.py` / `storyboard.py` 只读 `style_preset`，**不回落**
+      · `storyboard.py:672` 甚至 `getattr(cfg, "style_preset")` 在对象上取
+      后果（实测）：`taskctl.DEFAULT_PARAMS` 里没有 `style_preset` 这个键，
+      老项目只有手写的 `"style": "anime"` —— 于是**拆镜按 anime 写、抽卡用 realistic 的
+      负向词**，两边静默打架。
+    """
+    src: dict = {}
+    if isinstance(params, dict):
+        src = params
+    elif params is not None:                       # 允许传 Project 之类带属性的对象
+        src = {k: getattr(params, k, None) for k in ("style_preset", "style")}
+    v = src.get("style_preset")
+    if v and str(v).strip().lower() not in ("auto",):
+        return resolve_preset(v)
+    v2 = src.get("style")
+    if v2 and str(v2).strip().lower() not in ("auto",):
+        return resolve_preset(v2)
+    return DEFAULT_PRESET
+
+
+def negative_for_params(params: object) -> str:
+    """按 `preset_of(params)` 取负向词。调用方**不该**再自己 `.get("style_preset")`。"""
+    return negative_for(preset_of(params))
+
+
+def suffix_for_params(params: object) -> str:
+    """按 `preset_of(params)` 取**可进图像模型**的英文风格后缀（P2.3 接的就是它）。"""
+    return image_suffix(preset_of(params))
+
+
+def apply_image_suffix(prompt: object, params: object) -> str:
+    """
+    把风格后缀拼到一条图像提示词末尾（**幂等**：已经在里面就不重复加）。
+
+    ★ 这一行是 P2.3 的全部实质。`image_suffix` 这个字段早就定义好了
+    （注释还写着"只有这个字段可以进图像模型的提示词"），但**全仓库零调用** ——
+    于是"选了什么风格"从来没有真正影响到任何一张出图，
+    这正是 README「已知局限」里那句"改提示词里的风格句没用"的另一面：
+    不是文字没用，是**该进图的那段文字根本没进去**。
+
+    在**生成时**拼而不是写盘时拼，是为了让 `prompts/char_X.txt`
+    保持"用户可编辑的内容"，风格作为项目级修饰器随改随生效，不需要重写文件。
+    """
+    text = str(prompt or "").strip()
+    suffix = suffix_for_params(params).strip()
+    if not suffix:
+        return text
+    if suffix in text:
+        return text
+    return f"{text}. {suffix}" if text else suffix
+
+
 def get(name: object) -> dict[str, str]:
     return PRESETS[resolve_preset(name)]
 

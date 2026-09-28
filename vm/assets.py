@@ -33,6 +33,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from . import fsutil
 from typing import Any
 
 ASSETS_DIRNAME = "assets"
@@ -118,9 +119,7 @@ def save_index(proj, recs: dict[str, AssetRecord]) -> Path:
     p = index_path(proj)
     p.parent.mkdir(parents=True, exist_ok=True)
     data = {"version": 1, "assets": {k: v.to_dict() for k, v in sorted(recs.items())}}
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, p)
+    fsutil.write_json(p, data)
     return p
 
 
@@ -149,13 +148,34 @@ def build_prompt(proj, kind: str, aid: str) -> tuple[str, str]:
 # ── 出图 ────────────────────────────────────────────────────────────────────
 
 
+def asset_inputs(prompt: str, params: dict, seed: int, kind: str = "", aid: str = "") -> tuple[str, str, dict]:
+    """
+    这张概念图**实际提交给模型的** `(最终提示词, 负向词, 渲染参数)`。
+
+    与 `chars.portrait_inputs` 同一个理由：指纹与提交必须同源，否则
+    会出现"指纹说变了、其实没变"（或反之）。
+    """
+    from vm import style as _st
+    from vm.qi import QIConfig
+
+    cfg = QIConfig()
+    return (_st.apply_image_suffix(prompt, params),
+            _st.negative_for_params(params),
+            {"unet": cfg.unet_name or cfg.gen, "clip": cfg.clip_name, "vae": cfg.vae_name,
+             "gen": cfg.gen, "w": cfg.width, "h": cfg.height})
+
+
 def gen_candidates(proj, kind: str, aid: str, *, n: int = 2, force: bool = False,
+                   params: dict | None = None,
                    log=lambda m: print(m)) -> list[Candidate]:
     """为场景/道具出 n 张候选图。已有的候选会被保留（追加，不覆盖）。"""
     from vm.qi import QIConfig, QwenImage, QIResult
     from vm.state import Project
 
-    proj = Project(proj) if not hasattr(proj, "root") else proj
+    proj = Project.of(proj)
+    if params is None:
+        from vm import taskctl
+        params = taskctl.load_params(proj.root)
     name, prompt = build_prompt(proj, kind, aid)
     out_dir = asset_dir(proj, kind, aid)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -172,16 +192,24 @@ def gen_candidates(proj, kind: str, aid: str, *, n: int = 2, force: bool = False
     # 已有多少个 → 从那儿接着编 seed（可重复：同 seed 同图）
     have = {c.seed for c in rec.candidates}
     made: list[Candidate] = []
+    from vm import imgfp as _fp
     for i in range(int(n)):
         seed = SEED_BASE + (abs(hash((kind, aid))) % 900) + len(rec.candidates) + i
+        _final, _neg, _render = asset_inputs(prompt, params, seed, kind, aid)
+        fp = _fp.fingerprint(f"asset:{kind}", _final, _neg, _render, seed, {"id": aid})
+        dst_probe = out_dir / f"seed{seed}.png"
         if seed in have and not force:
-            continue
+            # ★ P2.4：已有候选只有在"出图输入没变"时才复用。
+            # 换风格后旧风格的候选不能再被当成已抽好的图 —— 那是最容易被采纳的一条错路。
+            if not _fp.is_stale(dst_probe, fp):
+                continue
+            log(f"  ⚠ {kind} {aid} seed={seed} 是旧输入出的，按当前风格重出")
         log(f"  ▶ {kind} {aid}（{name}）seed={seed}")
-        from vm import style as _st
-        _neg = _st.negative_for(params.get("style_preset")) if isinstance(params, dict) \
-            else _st.negative_for(None)
+        # P2.3：以前只拼 SCENE_SUFFIX/PROP_SUFFIX（构图纪律），风格后缀一个字没进 ——
+        # `build_prompt` 的注释还写着"复用项目的自动风格句，保证概念图和成片调性一致"，
+        # 实际那半句从来没被拼上。
         res: QIResult = qi.generate(
-            prompt, negative=_neg, seed=seed,
+            _final, negative=_neg, seed=seed,
             filename_prefix=f"VM_ASSET_{kind}_{aid}",
             log=lambda m: log(f"    ⚠ {m}"),
         )
@@ -190,6 +218,7 @@ def gen_candidates(proj, kind: str, aid: str, *, n: int = 2, force: bool = False
         comfy.download(img, dst)
         c = Candidate(seed=seed, file=dst.name,
                       mtime=int(dst.stat().st_mtime), size=dst.stat().st_size)
+        _fp.write(dst, fp, kind=f"asset:{kind}", id=aid, seed=seed)
         rec.candidates.append(c)
         made.append(c)
         log(f"    ✅ {dst.name}  {res.seconds:.1f}s  {dst.stat().st_size // 1024} KB")
@@ -202,7 +231,7 @@ def gen_candidates(proj, kind: str, aid: str, *, n: int = 2, force: bool = False
 def adopt(proj, kind: str, aid: str, file: str) -> AssetRecord:
     """采纳一张候选作为"定稿"。"""
     from vm.state import Project
-    proj = Project(proj) if not hasattr(proj, "root") else proj
+    proj = Project.of(proj)
     recs = load_index(proj)
     key = _key(kind, aid)
     rec = recs.get(key)
@@ -350,7 +379,7 @@ def add_upload(proj, kind: str, aid: str, filename: str, raw: bytes) -> Candidat
     文件名：`upload_<时间戳>_<安全化的原名>`，避免同名覆盖，也便于看出是上传的。
     """
     from vm.state import Project
-    proj = Project(proj) if not hasattr(proj, "root") else proj
+    proj = Project.of(proj)
     if kind not in ("scene", "prop"):
         raise ValueError(f"kind 必须是 scene 或 prop，收到 {kind!r}")
     if not raw:
@@ -364,10 +393,7 @@ def add_upload(proj, kind: str, aid: str, filename: str, raw: bytes) -> Candidat
         safe += ".png"
     fname = f"upload_{int(time.time())}_{safe}"
     dst = out_dir / fname
-    tmp = dst.with_suffix(dst.suffix + ".tmp")
-    with open(tmp, "wb") as f:
-        f.write(raw)
-    os.replace(tmp, dst)
+    fsutil.write_bytes(dst, raw)
 
     recs = load_index(proj)
     key = _key(kind, aid)

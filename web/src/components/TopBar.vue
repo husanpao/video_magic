@@ -34,6 +34,20 @@
       />
     </ElSelect>
 
+    <!-- 工作区切换器（F1.1）。W0→W1→W2→W3 就是流程顺序，但**不做强制向导**：
+         任何一屏可直达、可回退，老用户仍然直接落在镜头工作台上。 -->
+    <nav class="wsnav" data-testid="ws-nav" aria-label="工作区">
+      <a
+        v-for="w in WORKSPACES" :key="w.key"
+        class="wsbtn" :class="{ on: w.ready && $route.name === w.key, off: !w.ready }"
+        :href="w.ready ? '#' + w.path : undefined"
+        :aria-disabled="!w.ready || undefined"
+        :data-testid="`ws-tab-${w.key}`"
+        :title="w.ready ? w.hint : `${w.hint}（尚未实施）`"
+        @click.prevent="w.ready && go(w.path)"
+      ><span class="wsno tabular">{{ wsNo(w.key) }}</span>{{ w.label }}</a>
+    </nav>
+
     <span class="pill" :class="pill.cls">{{ pill.text }}</span>
 
     <!-- 阶段 stepper（U7）。每一步都可点（= 旧的阶段按钮），未就绪的挂 ⚠ 与原因 title。 -->
@@ -60,6 +74,19 @@
       :title="stageTitle('all')"
       @click="runStage('all')"
     >全链</button>
+
+    <!-- 成片入口（有 EP 时才亮）。2026-09-28 用户反馈「成片现在界面看不到了」：
+         右栏的「成片」tab 按新架构搬去了 W4 审片屏，入口只剩工作区切换器里的「4 成片」，
+         紧挨着阶段序号（1拆镜…5合成），两排数字并排很容易漏掉。
+         这里给一个**显式按钮**：有成品就直接点，不必先理解「工作区」这个概念。 -->
+    <a
+      v-if="hasFinal"
+      class="finalbtn"
+      data-testid="btn-open-final"
+      href="#/review"
+      :title="`看 ${state.finals.length} 集成片（成片与审片屏：播放器 + 质检/审计清单，点问题跳镜）`"
+      @click.prevent="go('/review')"
+    >▶ 看成片<span v-if="state.finals.length > 1" class="tabular">（{{ state.finals.length }}）</span></a>
 
     <span class="spacer" />
 
@@ -151,12 +178,23 @@ import {
 import { helpOpen } from '@/composables/useHotkeys'
 import { confirmAction } from '@/composables/confirmAction'
 import SettingsDialog from '@/components/SettingsDialog.vue'
+import { WORKSPACES, type WorkspaceKey } from '@/router'
+
+/** 工作区编号 = 流程顺序（0 项目 / 1 章节 / 2 风格 / 3 镜头），切换器上的小数字。 */
+function wsNo(key: WorkspaceKey): number {
+  return WORKSPACES.findIndex((w) => w.key === key)
+}
+function go(path: string): void {
+  if (`#${path}` !== window.location.hash) window.location.hash = path
+}
 
 /** 「强制重跑」/「试运行」两个开关：旧文件是 #force / #dry 两个 checkbox，语义直接对应 api.run 的 force/dry。 */
 const force = ref(false)
 const dry = ref(false)
 /** 设置面板显隐（T4，Lead 集成接线）。 */
 const settingsOpen = ref(false)
+/** 已有成片（`/api/status` 的 finals）→ 顶栏亮出「▶ 看成片」直达 W4 审片屏。 */
+const hasFinal = computed(() => (state.finals || []).length > 0)
 
 /* ---------------- 任务 pill ---------------- */
 // 旧 refreshStatus()：运行中 · 阶段 / 已停止 (rc=) / 结束 (rc=) / 空闲
@@ -407,6 +445,15 @@ async function openReset() {
 }
 .stages-all:disabled { opacity: 0.45; cursor: not-allowed; }
 
+/* 成片入口：与阶段按钮区分开（阶段=改内容，这个是"看结果"），所以用实心青柠描边而不是同款灰底 */
+.finalbtn {
+  font: inherit; font-size: 12px; padding: 4px 11px; cursor: pointer; text-decoration: none;
+  font-weight: 600; border-radius: 999px; color: var(--ink);
+  background: color-mix(in srgb, var(--ok) 18%, var(--card));
+  border: 1px solid color-mix(in srgb, var(--ok) 45%, var(--line));
+}
+.finalbtn:hover { background: color-mix(in srgb, var(--ok) 30%, var(--card)); }
+
 /* ---- 撤销 / 重做 ---- */
 .histbtns { display: flex; gap: 4px; }
 .undobtn {
@@ -460,4 +507,22 @@ async function openReset() {
   border-radius: 50%; border: 1px solid var(--line); background: var(--card); color: var(--muted);
 }
 .helpbtn:hover { color: var(--ink); border-color: color-mix(in srgb, var(--lime) 70%, var(--ink)); }
+
+/* 工作区切换器（F1.1）。样式放在本组件的 scoped 里而不是 theme.css ——
+   theme.css 是 v0.2 冻结的公共契约（其他组件与 E2E 都依赖它），不该为新导航条改动。 */
+.wsnav { display: inline-flex; align-items: center; gap: 2px; margin-left: 8px; }
+.wsbtn {
+  display: inline-flex; align-items: center; gap: 4px; text-decoration: none;
+  font-size: 11.5px; color: var(--text-3); padding: 3px 8px; border-radius: 7px;
+  border: 1px solid transparent; cursor: pointer; white-space: nowrap;
+}
+.wsbtn:hover { background: var(--hover); color: var(--ink); }
+.wsbtn.on { background: var(--surface-3); color: var(--ink); border-color: var(--line); font-weight: 600; }
+.wsbtn.off { color: var(--text-4); opacity: .55; cursor: help; }
+.wsbtn.off:hover { background: transparent; color: var(--text-4); }
+.wsno {
+  display: inline-grid; place-items: center; width: 14px; height: 14px; border-radius: 50%;
+  font-size: 9.5px; background: var(--surface-3); border: 1px solid var(--line); color: var(--muted);
+}
+.wsbtn.on .wsno { background: var(--lime-deep); color: var(--bg); border-color: var(--lime-deep); }
 </style>

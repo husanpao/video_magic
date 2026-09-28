@@ -1,16 +1,19 @@
 <template>
-  <!-- ④ 420px 右栏：7 个面板（日志 / 角色定妆 / 场景 / 道具 / 质检 / 审计 / 成片） -->
+  <!-- ④ 420px 右栏：7 个面板（日志 / 角色定妆 / 剧本 / 场景与道具 / 分镜图 / 质检 / 审计）。
+       ★ 原来的 9 个已经收到 7（F3.1）：
+         · 场景 + 道具 → 一个 tab（同一件事的两半，见 ScenePropTab）
+         · 成片 → 搬去 W4 审片屏。420px 里放播放器本来就是将错就错：
+           播放器只有 260px 高，而"边播边查质检问题"要求问题清单和画面同屏 ——
+           那一屏现在有整页宽度，所以这里不再留一份缩小的副本。 -->
   <aside class="col col-right">
     <el-tabs class="rptabs" :model-value="state.tab" @tab-change="onTabChange">
       <el-tab-pane label="日志" name="log" lazy><LogTab /></el-tab-pane>
       <el-tab-pane label="角色定妆" name="chars" lazy><CharsTab /></el-tab-pane>
       <el-tab-pane label="剧本" name="script" lazy><ScriptTab /></el-tab-pane>
-      <el-tab-pane label="场景" name="scenes" lazy><ScenesTab /></el-tab-pane>
-      <el-tab-pane label="道具" name="props" lazy><PropsTab /></el-tab-pane>
+      <el-tab-pane label="场景与道具" name="sceneProp" lazy><ScenePropTab /></el-tab-pane>
       <el-tab-pane label="分镜图" name="storyboard" lazy><StoryboardTab /></el-tab-pane>
       <el-tab-pane label="质检" name="qc" lazy><QcTab @select="onSelect" /></el-tab-pane>
       <el-tab-pane label="审计" name="audit" lazy><AuditTab @select="onSelect" /></el-tab-pane>
-      <el-tab-pane label="成片" name="final" lazy><FinalTab /></el-tab-pane>
     </el-tabs>
   </aside>
 </template>
@@ -21,7 +24,7 @@
  *
  * 移植自 vm/static/index.html 的 renderTabs() 与 `$('tabs')` 的点击处理：
  *   切换 tab → 按需刷新（qc→refreshQc / audit→refreshAudit / chars→refreshChars /
- *   scenes→refreshScenes），props 是后加的同类数据源，一并纳入。
+ *   sceneProp→refreshScenes+refreshProps+refreshAssets）。
  *
  * `lazy` 让每个 tab 面板**首次被激活时才挂载**，配合各 tab 自己的 onMounted
  * 「首次进入拉一次」，避免每次切回都重复整表拉取。
@@ -30,37 +33,19 @@ import { onMounted } from 'vue'
 import { ElTabPane, ElTabs } from 'element-plus'
 import LogTab from '@/components/tabs/LogTab.vue'
 import CharsTab from '@/components/tabs/CharsTab.vue'
-import ScenesTab from '@/components/tabs/ScenesTab.vue'
+import ScenePropTab from '@/components/tabs/ScenePropTab.vue'
 import ScriptTab from '@/components/tabs/ScriptTab.vue'
-import PropsTab from '@/components/tabs/PropsTab.vue'
 import StoryboardTab from '@/components/tabs/StoryboardTab.vue'
 import QcTab from '@/components/tabs/QcTab.vue'
 import AuditTab from '@/components/tabs/AuditTab.vue'
-import FinalTab from '@/components/tabs/FinalTab.vue'
-import {
-  refreshAssets,
-  refreshAudit,
-  refreshChars,
-  refreshProps,
-  refreshQc,
-  refreshScenes,
-  refreshScript,
-  refreshStoryboard,
-  state,
-} from '@/stores/app'
+import { state } from '@/stores/app'
+import { refreshTab } from '@/stores/refresh'
 
-/** tab 名 → 该 tab 的数据源刷新函数（log / final 的数据由 App.vue 轮询维护，无需刷新）。 */
-const REFRESH: Record<string, () => Promise<void>> = {
-  chars: refreshChars,
-  scenes: refreshScenes,
-  props: refreshProps,
-  // 场景/道具 tab 里带候选概念图，所以一并刷 assets
-
-  storyboard: refreshStoryboard,
-  script: refreshScript,
-  qc: refreshQc,
-  audit: refreshAudit,
-}
+/**
+ * tab → 数据源那张表在 `stores/refresh.ts`（全仓库唯一一份）。
+ * 以前这里有一份和 `App.vue` 的轮询表**平行维护**的 `REFRESH`，两份会漂：
+ * `completeness` 只进了轮询表，于是切到「完备性」tab 反而不立刻刷新。
+ */
 
 /** 「定位该镜」：写 state.selected，由镜头表 / 胶片条 / 详情弹层响应。 */
 function onSelect(id: string) {
@@ -68,14 +53,12 @@ function onSelect(id: string) {
 }
 
 async function refreshFor(tab: string) {
-  if (tab === 'scenes' || tab === 'props') await refreshAssets()
-  const fn = REFRESH[tab]
-  if (!fn) return
   try {
-    await fn()
+    await refreshTab(tab)
   } catch {
     // 各 tab 组件自己有就地错误态（首次进入会自己拉一次，失败信息就地显示）；
     // 这里静默，避免同一个失败弹两次。
+    // （refresh* 都已过 guard()，正常不会抛 —— 这层是"切 tab"路径的保险。）
   }
 }
 

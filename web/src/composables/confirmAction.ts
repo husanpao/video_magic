@@ -35,6 +35,15 @@ export interface ConfirmActionOptions {
   cancelText?: string
   /** 危险操作：确认按钮变红 */
   danger?: boolean
+  /**
+   * 需要**手输这个字符串**才放行（不可逆操作的最后一道闸）。
+   *
+   * 为什么要有：`/api/reset` 早就要求"手输项目名"（`taskctl.reset_project` 里
+   * `confirm != 项目名` 直接抛），但那个输入框只在 ResetDialog 里手写过一份。
+   * 现在删除项目也要同一道闸 —— 与其再抄一遍，不如把它做成公共能力。
+   * 后端始终会再校验一次，这里的输入只是"让人慢下来想一想"。
+   */
+  requireTyped?: string
 }
 
 /** 清单渲染：≤12 条逐条摆，多了折叠成「… 等共 N 个」—— 列 52 行的确认框没人看。 */
@@ -45,7 +54,9 @@ function listLines(items: string[], cap = 12): string[] {
 }
 
 export async function confirmAction(opts: ConfirmActionOptions): Promise<boolean> {
-  const { title, message, list, confirmText = '确定', cancelText = '取消', danger = false } = opts
+  const {
+    title, message, list, confirmText = '确定', cancelText = '取消', danger = false, requireTyped,
+  } = opts
   // 消息体用 vnode 拼：message 与清单分行展示，清单保持等宽对齐（id 列表才对得齐）
   const body = h('div', { class: 'confirm-action-body' }, [
     h('div', { style: 'white-space:pre-wrap;line-height:1.6' }, message),
@@ -54,6 +65,20 @@ export async function confirmAction(opts: ConfirmActionOptions): Promise<boolean
       : []),
   ])
   try {
+    if (requireTyped) {
+      // prompt 型：输入必须逐字等于 requireTyped（首尾空白由后端 strip 兜容）。
+      // 输入不对就不让点确定 —— 这正是"手输名字"这个动作的全部意义。
+      await ElMessageBox.prompt(body, title, {
+        confirmButtonText: confirmText,
+        cancelButtonText: cancelText,
+        inputPlaceholder: `输入「${requireTyped}」以确认`,
+        inputValidator: (v: string) =>
+          (String(v ?? '').trim() === requireTyped ? true : `请逐字输入「${requireTyped}」`),
+        customClass: danger ? 'confirm-action confirm-action-danger confirm-action-typed' : 'confirm-action confirm-action-typed',
+        ...(danger ? { confirmButtonClass: 'el-button--danger' } : {}),
+      })
+      return true
+    }
     await ElMessageBox.confirm(body, title, {
       confirmButtonText: confirmText,
       cancelButtonText: cancelText,

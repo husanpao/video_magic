@@ -43,9 +43,9 @@ costumes.py —— 服装变体系统（P2）。
 from __future__ import annotations
 
 import json
-import os
 import re
 from pathlib import Path
+from . import fsutil
 from typing import Any
 
 VERSION = 1
@@ -60,13 +60,11 @@ _CLOTHING_START = re.compile(
 
 
 def _atomic_write_json(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    """原子写 JSON。实现收敛在 `vm/fsutil.py`。
+
+    本文件**不排序键**（其余几处排）—— 保持原样，收敛实现不该顺手动文件字节。
+    """
+    fsutil.write_json(path, data, trailing_newline=False)
 
 
 def split_identity_costume(appearance: str) -> tuple[str, str]:
@@ -200,6 +198,71 @@ def ensure_from_cards(proj, cards: dict) -> dict:
 # 所以字段变更时必须**确定性重建**提示词，不做 LLM 调用。
 
 _SECTION_RE = re.compile(r"^([a-z_]+): (.*?)(?=\n[a-z_]+: |\Z)", re.S | re.M)
+
+
+def variants_of_chapter(data: dict, name: str, chapter: int | None) -> dict | None:
+    """
+    某角色在**某一章**该用的造型变体。
+
+    规则：找 `chapter` 字段等于该章号的变体；找不到返回 None（调用方回落默认变体）。
+    刻意**不做"向前找最近的一章"** —— 那等于让第 5 章沿用第 3 章的造型，
+    而第 5 章正文里可能又换了一次衣服；宁可回落默认并让界面显示"这章没有专属造型"，
+    也不要静默用一个可能错误的造型。
+    """
+    if not chapter:
+        return None
+    for v in variants_of(data, name):
+        try:
+            if int(v.get("chapter") or 0) == int(chapter):
+                return v
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def set_chapter_variant(proj, name: str, chapter: int, *, variant_id: str,
+                        label: str = "", prompt: str = "") -> dict:
+    """
+    给某角色的某个变体打上"服务于第 N 章"的标记（没有就新建该变体）。
+
+    形状按真实存储来：`characters[<角色>]["variants"]` 是个列表 ——
+    这里刻意不另发明一种顶层 `variants` 结构，那会让两套读法并存。
+    """
+    data = load(proj)
+    chars = data.setdefault("characters", {})
+    ent = chars.get(name)
+    if not isinstance(ent, dict):
+        ent = chars[name] = {"identity": "", "variants": []}
+    vs = ent.get("variants")
+    if not isinstance(vs, list):
+        vs = ent["variants"] = []
+    for v in vs:
+        if str(v.get("id") or "") == str(variant_id):
+            v["chapter"] = int(chapter)
+            if prompt:
+                v["prompt"] = prompt
+            if label:
+                v["label"] = label
+            save(proj, data)
+            return dict(v)
+    v = {"id": str(variant_id), "label": label or str(variant_id),
+         "prompt": prompt, "chapter": int(chapter)}
+    vs.append(v)
+    save(proj, data)
+    return dict(v)
+
+
+def chapters_with_variants(proj, name: str) -> list[int]:
+    """某角色有哪些章登记了专属造型（实体总表要显示这个）。"""
+    out = []
+    for v in variants_of(load(proj), name):
+        try:
+            ch = int(v.get("chapter") or 0)
+        except (TypeError, ValueError):
+            continue
+        if ch and ch not in out:
+            out.append(ch)
+    return sorted(out)
 
 
 def parse_sections(prompt: str) -> dict[str, str]:

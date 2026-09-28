@@ -40,7 +40,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import struct
 import subprocess
@@ -49,6 +48,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from . import fsutil
 from typing import Any, Callable
 
 from .comfy import Comfy, ComfyError
@@ -288,14 +288,11 @@ def image_prompt_of(prompt: str, *, with_subject_defs: bool = False) -> tuple[st
 
 
 def _atomic_write_json(path: Path, data: Any) -> None:
-    """先写 .tmp 再 os.replace，避免留下半个 JSON（与 state.py 同一策略）。"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    """原子写 JSON。实现已收敛到 `vm/fsutil.py`（唯一真相）。
+
+    保留这个薄壳是为了不动本模块的调用点 —— 收敛的验收标准是"行为逐字节不变"。
+    """
+    fsutil.write_json(path, data, sort_keys=True, trailing_newline=False)
 
 
 @dataclass
@@ -567,7 +564,11 @@ def render_shot(
     # 前向说清要什么，负向说清不要什么；`plastic skin` 这类正是假感的来源）
     if not negative:
         from vm import style as _st
-        negative = _st.negative_for((params or {}).get("style_preset"))
+        negative = _st.negative_for_params(params)
+    # P2.3 + P2.4：风格后缀进提示词，而 `prompt` 进 `qi_fingerprint` ——
+    # 于是**换风格会让分镜图自动变 stale**，不必手工 force 重出、也不会新旧风格混存。
+    from vm import style as _st2
+    prompt = _st2.apply_image_suffix(prompt, params)
     fp = qi_fingerprint(prompt, negative, cfg.render_dict(), use_seed)
     st = index.status(shot.id, fp, png)
 
@@ -672,7 +673,7 @@ def list_status(shots: list[Shot], cfg: QIConfig, index: SBIndex, proj: Any,
         # 前向说清要什么，负向说清不要什么；`plastic skin` 这类正是假感的来源）
         if not negative:
             from vm import style as _st
-            negative = _st.negative_for(getattr(cfg, "style_preset", None))
+            negative = _st.negative_for_params(cfg)
         fp = qi_fingerprint(prompt, negative, cfg.render_dict(), use_seed)
         png = sb_dir / f"{s.id}.png"
         st = index.status(s.id, fp, png)

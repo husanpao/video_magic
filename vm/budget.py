@@ -27,9 +27,9 @@ budget.py —— E3 预算护栏：**暂停等人批，而不是硬失败**。
 from __future__ import annotations
 
 import json
-import os
 import time
 from pathlib import Path
+from . import fsutil
 from typing import Any
 
 LEDGER = "cost.jsonl"
@@ -320,9 +320,7 @@ def grant_approval(project: str | Path, *, by: str = "user", stage: str = "",
     p = Path(pdir) / "state" / APPROVAL
     p.parent.mkdir(parents=True, exist_ok=True)
     payload = {"granted_at": time.time(), "by": by, "stage": stage, "note": note}
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, p)
+    fsutil.write_json(p, payload)
     return payload
 
 

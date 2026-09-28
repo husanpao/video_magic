@@ -270,6 +270,9 @@ export interface ChapterRow {
   shots_file: string
   has_shots: boolean
   shots: number
+  /** P1：正文比镜头表新 → 这一章需要重拆。detail=0 时字段不存在，故可选。 */
+  needs_replan?: boolean
+  needs_sync?: boolean
 }
 
 export interface ChaptersResponse {
@@ -279,6 +282,156 @@ export interface ChaptersResponse {
   total_chapters: number
   total_shots: number
   shot_files: string[]
+  /* ↓ P1 章节管理的全景字段。`/api/chapters?detail=0` 会退回没有这些字段的旧形状，
+     所以它们都是**可选** —— 界面必须能区分"没有这个字段"与"字段为 0/假"。 */
+  has_manifest?: boolean
+  conflicts?: string[]
+  changed_chapters?: number[]
+  meta?: ProjectMeta
+  replanned_count?: number
+  next_step?: string
+}
+
+/** 项目元信息（P1）。`_layer: file|derived` 说明它是真存了还是从现状反推的。 */
+export interface ProjectMeta {
+  name: string
+  title: string
+  source_type: 'novel' | 'script'
+  logline: string
+  style_preset: 'auto' | 'realistic' | 'cg' | 'anime'
+  created_at?: number
+  _layer?: 'file' | 'derived'
+}
+
+export interface ChapterDetail {
+  ok: boolean
+  no: number
+  title: string
+  file: string
+  text: string
+  chars: number
+}
+
+/** 章节写操作的公共回执：拿到最新的整份清单，界面不必再单独刷一次。 */
+export interface ChapterMutationResult {
+  ok: boolean
+  message: string
+  hint?: string
+  no?: number
+  title?: string
+  file?: string
+  added?: boolean
+  changed?: boolean
+  chars?: number
+  chapters?: ChapterRow[]
+  imported?: Array<{ no: number; title: string; file: string; chars: number }>
+  skipped?: Array<{ filename: string; reason: string }>
+  moved?: string[]
+}
+
+export interface CreateProjectResult {
+  ok: boolean
+  project: string
+  path: string
+  meta: ProjectMeta
+  message: string
+  next?: string
+}
+
+/** 项目删除是移进 projects/_trash/，不是 rm。 */
+export interface ProjectDeleteResult {
+  ok: boolean
+  project: string
+  entry: string
+  trash: string
+  files: number
+  size: number
+  message: string
+  hint: string
+}
+
+export interface ProjectTrashItem {
+  entry: string
+  project: string
+  mtime: number
+  files: number
+  size: number
+  chapters: number
+  has_novel: boolean
+}
+
+export interface ProjectTrashResponse {
+  ok: boolean
+  root: string
+  items: ProjectTrashItem[]
+  message: string
+}
+
+/** W2 风格屏的数据形状（对应后台 register.summary / style_impact）。 */
+export interface StyleInfo {
+  ok?: boolean
+  project?: string
+  preset: string
+  sentence: string
+  source: string
+  confirmed: boolean
+  reason: string
+  confidence: number | null
+  book_chars?: number
+  sampled_chapters?: number[]
+  presets: Array<{ key: string; label: string; sentence: string; on: boolean }>
+  note: string
+}
+
+export interface StyleImpact {
+  ok?: boolean
+  from: { preset: string; sentence: string; source: string }
+  to: { preset: string; sentence: string }
+  changed: boolean
+  images: {
+    portraits: { total: number; stale: number; untracked: number; never: number; names: string[] }
+    assets: { total: number; stale: number; untracked: number; keys: string[] }
+    note: string
+  }
+  shots: {
+    total: number; with_old_style: number; auto_stale: number
+    requires: string; note: string
+  }
+}
+
+/** 实体总表的一行（角色 / 场景 / 道具共用一个形状，按 kind 分叉字段）。 */
+export interface EntityRow {
+  kind: 'char' | 'scene' | 'prop'
+  id: string
+  name: string
+  /** 出现在哪些章。空数组 + chapters_known=false 才是"未知" —— v1 老项目没登记字段，后端从镜头表反推 */
+  chapters: number[]
+  shot_count: number
+  has_prompt?: boolean
+  portrait_variants?: Array<{ path: string; chapter: number | null; kind: string }>
+  portrait_chapters?: number[]
+  costume_variants?: string[]
+  location?: string
+  time_of_day?: string
+  lighting?: string
+  owner?: string
+  inferred?: boolean
+}
+
+export interface EntitiesResponse {
+  ok: boolean
+  project: string
+  entities: EntityRow[]
+  totals: { char: number; scene: number; prop: number }
+  suspect_merges: string[]
+  never_used: string[]
+}
+
+export interface ChapterTrash {
+  ok: boolean
+  project: string
+  items: Array<{ path: string; size: number; mtime: number }>
+  message: string
 }
 
 export interface EpisodeInfo {
@@ -478,9 +631,12 @@ export interface ProjectSummary {
   refs: number
   char_prompts: number
   final: { name: string; size: number; mtime: number } | null
+  finals?: EpisodeInfo[]
   running: boolean
   task_stage: string
   progress: { stage: string; label: string; done: number; total: number; pct: number }
+  /** P1：随列表一起带回，省掉前端 N+1 次 /api/project/meta */
+  meta?: ProjectMeta
 }
 
 export interface ProjectsResponse {

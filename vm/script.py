@@ -27,12 +27,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from . import fsutil
 from typing import Any
 
 SCRIPT_DIRNAME = "scripts"
@@ -427,10 +427,7 @@ def script_path(proj, chapter_no: int) -> Path:
 def save_script(proj, script: ChapterScript) -> Path:
     p = script_path(proj, script.chapter)
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(script.to_dict(), ensure_ascii=False, indent=2) + "\n",
-                   encoding="utf-8")
-    os.replace(tmp, p)
+    fsutil.write_json(p, script.to_dict())
     return p
 
 

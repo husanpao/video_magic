@@ -29,6 +29,7 @@ import urllib.parse
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutTimeout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from vm import fsutil
 
 from vm import taskctl
 from vm import config as vm_config  # T3 配置中心：/api/config 委托给它，本层只做参数校验+错误映射
@@ -73,6 +74,18 @@ class _Abort(Exception):
         # extra：把结构化载荷一并带给 UI（E3 的"暂停等人批"要它 —— 载荷里带着
         # 已花多少 / 卡在哪步 / 再放行多少，UI 才能直接弹对话框而不用去翻日志）。
         self.extra = dict(extra or {})
+
+
+def _web_log(msg: str) -> None:
+    """
+    给"需要 log 回调"的后台模块（register.set_style / recommend）用的落点。
+
+    ★ 不能直接传 `log` —— `web.py` 里**没有** `log` 这个名字（我第一次就这么写过，
+    实测 `/api/style/set` 回 500 `NameError: name 'log' is not defined`）。
+    handler 侧没有 run.log 的写入权（那是 worker/taskctl 的地盘），
+    所以这类"点了之后服务器要知道发生了什么"的信息走 stderr。
+    """
+    print(f"[web] {msg}", file=sys.stderr, flush=True)
 
 
 def _log_exc(where: str) -> None:
@@ -354,6 +367,17 @@ ROUTES_GET = {
     "/api/shot": "api_shot",
     "/api/qc": "api_qc",
     "/api/audit": "api_audit",
+    # P1 前门：项目与章节管理
+    "/api/project/meta": "api_project_meta",
+    "/api/project/trash": "api_project_trash",
+    "/api/chapter": "api_chapter_read",
+    "/api/chapter/trash": "api_chapter_trash",
+    # P2 风格层
+    "/api/style": "api_style_get",
+    "/api/style/impact": "api_style_impact",
+    # P3 实体总表
+    "/api/entities": "api_entities",
+    "/api/entities/chapter": "api_entities_chapter",
     "/view": "view",
 }
 
@@ -388,6 +412,23 @@ ROUTES_POST = {
     "/api/shot/undo": "api_shot_undo",
     "/api/shots/bulk": "api_shots_bulk",
     "/api/shots/renumber": "api_shots_renumber",
+    # P1 前门：项目与章节管理
+    "/api/project/create": "api_project_create",
+    "/api/project/update": "api_project_update",
+    "/api/project/delete": "api_project_delete",
+    "/api/project/restore": "api_project_restore",
+    "/api/chapter/save": "api_chapter_save",
+    "/api/chapter/import": "api_chapter_import",
+    "/api/chapter/delete": "api_chapter_delete",
+    "/api/chapter/rename": "api_chapter_rename",
+    "/api/chapter/reorder": "api_chapter_reorder",
+    # P2 风格层
+    "/api/style/set": "api_style_set",
+    "/api/style/recommend": "api_style_recommend",
+    "/api/style/regen": "api_style_regen",
+    # P3 实体总表：合并 / 拆分 / 按章出专属定妆
+    "/api/entities/merge": "api_entities_merge",
+    "/api/entities/portrait": "api_entities_portrait",
 }
 
 # 唯一的「前缀路由」：Vite 产物 /assets/<file>（文件名带 hash，无法逐个精确登记）。
@@ -395,7 +436,16 @@ ROUTES_POST = {
 PREFIX_ROUTES_GET = {"/assets/": "page_asset"}
 
 # 需要放宽请求体上限的路由（上传走 base64，会膨胀 4/3）
-BODY_LIMITS = {"/api/chars/upload": MAX_UPLOAD_BODY}
+BODY_LIMITS = {"/api/chars/upload": MAX_UPLOAD_BODY,
+               # ★ `/api/asset/upload`（场景/道具自有图）与 chars/upload 走**同一套**
+               # base64 图片解码，以前却只拿到 1MB 默认上限 —— 上传一张 ≳750KB 的概念图
+               # 就会失败，而报错完全看不出是体积问题。两个入口必须同宽。
+               "/api/asset/upload": MAX_UPLOAD_BODY,
+               # P1：粘贴一整章正文 / 批量导入多个章节文件。
+               # 1MB 的默认上限装不下"一次导 20 章"（每章万字就是几十万字），
+               # 而章节正文是用户唯一的手写内容，被截断比传错文件更难发现。
+               "/api/chapter/save": MAX_UPLOAD_BODY,
+               "/api/chapter/import": MAX_UPLOAD_BODY * 8}
 
 
 def _verify_routes(cls) -> None:
@@ -421,6 +471,18 @@ def _verify_routes(cls) -> None:
 
 
 # ---------------------------------------------------------------- Handler
+
+
+def _proj_mod():
+    """
+    延迟导入 vm/proj.py。
+
+    ★ 必须是**模块级函数**，不能定义在 handler 类体里 —— 类作用域对方法不可见，
+    写成 `class H: def _proj_mod(): ...` 然后在方法里 `_proj_mod()` 会 NameError。
+    延迟导入的理由与 `taskctl.import_module` 一致：服务不该因缺模块起不来。
+    """
+    from vm import proj as _P
+    return _P
 
 
 def make_handler(projects_root: Path, default_project: str | None = None):
@@ -606,6 +668,16 @@ def make_handler(projects_root: Path, default_project: str | None = None):
                             name = pname
                             break
                 if name is None:
+                    # ★ 把"路径不存在"和"路径存在但方法用反了"分开报。
+                    #   混成一句"没有这个路径"，会把人带去查路由表、怀疑服务没更新，
+                    #   而真因只是拿 GET 去访问了一个 POST 端点。
+                    if table is ROUTES_GET and path in ROUTES_POST:
+                        raise _Abort(405, "wrong_method",
+                                     f"{path} 是 POST 端点，请改用 POST（GET 不接受）")
+                    if table is not ROUTES_GET and (path in ROUTES_GET
+                                                    or any(path.startswith(p) for p in PREFIX_ROUTES_GET)):
+                        raise _Abort(405, "wrong_method",
+                                     f"{path} 是 GET 端点，请改用 GET（POST 不接受）")
                     raise _Abort(404, "not_found", f"没有这个路径：{path}")
                 if method == "POST":
                     return getattr(self, name)(self._body(BODY_LIMITS.get(path)))
@@ -651,6 +723,11 @@ def make_handler(projects_root: Path, default_project: str | None = None):
                     # 单个项目进度推导失败不该拖垮整个列表，但要留栈 —— 静默给 0 会骗人
                     _log_exc(f"derive_progress({n})")
                     s["progress"] = {"pct": 0, "done": 0, "total": 0, "label": ""}
+                # P1：项目卡要显示标题/一句话题材/来源类型。
+                # 带在 /api/projects 里而不是让前端逐项目再打一次 /api/project/meta ——
+                # 项目数量一多那就是 N+1 请求。老项目没有 meta 文件，
+                # project_meta() 会从现状反推（不报错），所以这里无条件带上。
+                s["meta"] = _proj_mod().project_meta(n, projects_root)
                 items.append(s)
             self._json({"ok": True, "root": str(projects_root), "default": default_project or (names[0] if names else ""), "projects": items})
 
@@ -990,12 +1067,391 @@ def make_handler(projects_root: Path, default_project: str | None = None):
             self._json(t)
 
         def api_chapters(self):
-            """GET /api/chapters：集/章清单 + 每章镜数（多集管理的数据源）。"""
+            """
+            GET /api/chapters：集/章清单 + 每章镜数 + 章节管理需要的全景。
+
+            `detail=0` 可以退回旧的纯 `chapter_table` 形状。默认带 detail，
+            因为 P1 的章节屏需要 `needs_replan` / `next_step` / `meta`
+            才能把"该干什么"显示出来 —— 而 `proj.chapter_status()` 是
+            `chapter_table` 的**超集**（旧字段一个字没动），所以这是向后兼容的加字段。
+            """
             q = self._query()
             name = self._project_arg(q)
-            t = taskctl.chapter_table(name, projects_root)
+            if str(q.get("detail") or "1") in ("0", "false", ""):
+                t = taskctl.chapter_table(name, projects_root)
+            else:
+                t = _proj_mod().chapter_status(name, projects_root)
             t["ok"] = True
             self._json(t)
+
+        # ── P1 前门：项目 ────────────────────────────────────────────────
+        def api_project_meta(self):
+            """GET /api/project/meta：项目元信息（标题/来源类型/一句话题材）。"""
+            q = self._query()
+            name = self._project_arg(q)
+            out = _proj_mod().project_meta(name, projects_root)
+            out["ok"] = True
+            self._json(out)
+
+        def api_project_create(self, body: dict):
+            """POST /api/project/create：新建项目（目录 + project_meta.json + 空清单）。"""
+            pr = _proj_mod()
+            try:
+                self._json(pr.create_project(
+                    str(body.get("name") or ""),
+                    title=str(body.get("title") or ""),
+                    source_type=str(body.get("source_type") or "novel"),
+                    logline=str(body.get("logline") or ""),
+                    style_preset=str(body.get("style_preset") or "auto"),
+                    root=projects_root))
+            except taskctl.TaskError as e:
+                raise _Abort(400, "bad_request", str(e)) from e
+
+        def api_project_update(self, body: dict):
+            """POST /api/project/update：改项目元信息（只接受白名单字段）。"""
+            name = str(body.get("project") or default_project or "")
+            if not name:
+                raise _Abort(400, "no_project", "请求里必须带 project")
+            pr = _proj_mod()
+            try:
+                self._json(pr.update_project_meta(
+                    name, body.get("patch") if isinstance(body.get("patch"), dict) else body,
+                    projects_root))
+            except taskctl.TaskError as e:
+                raise _Abort(400, "bad_request", str(e)) from e
+
+        def api_project_trash(self):
+            """GET /api/project/trash：回收站里有哪些被删掉的项目（可逆性要能被看见）。"""
+            self._json(_proj_mod().list_project_trash(projects_root))
+
+        def api_project_delete(self, body: dict):
+            """
+            POST /api/project/delete：删除项目 = 移进 `projects/_trash/`（**不 rm**）。
+
+            ★ 这里**故意不回落 default_project**：删的是用户全部内容，
+              客户端漏传 `project` 时"删掉当前默认项目"是最坏的猜测 —— 直接 400 报错。
+            """
+            name = str(body.get("project") or "")
+            if not name:
+                raise _Abort(400, "no_project", "删除必须显式指定 project（不回落默认项目）")
+            pr = _proj_mod()
+            try:
+                self._json(pr.delete_project(
+                    name, confirm=str(body.get("confirm") or ""), root=projects_root))
+            except taskctl.TaskError as e:
+                raise _Abort(400, "bad_request", str(e)) from e
+
+        def api_project_restore(self, body: dict):
+            """POST /api/project/restore：从回收站放回一个项目（重名则拒绝，不覆盖）。"""
+            pr = _proj_mod()
+            try:
+                self._json(pr.restore_project(str(body.get("entry") or ""), root=projects_root))
+            except taskctl.TaskError as e:
+                raise _Abort(400, "bad_request", str(e)) from e
+
+        # ── P1 前门：章节 ────────────────────────────────────────────────
+        def api_chapter_read(self):
+            """GET /api/chapter?project=&no=：读某章正文（编辑器初始值）。"""
+            q = self._query()
+            name = self._project_arg(q)
+            no = (q.get("no") or "").strip()
+            if not no.isdigit():
+                raise _Abort(400, "bad_no", "no 必须是章号（整数）")
+            try:
+                out = _proj_mod().read_chapter(name, int(no), projects_root)
+            except taskctl.TaskError as e:
+                raise _Abort(400, "bad_request", str(e)) from e
+            out["ok"] = True
+            self._json(out)
+
+        # ── P2 风格层 ────────────────────────────────────────────────────
+        def _style_mod(self):
+            from vm import register as _R
+            return _R
+
+        def _style_proj(self, name: str):
+            from vm.state import Project
+            return Project(taskctl.resolve_project(name, projects_root))
+
+        def api_style_get(self):
+            """GET /api/style：整本风格现状 + 预设卡片数据。"""
+            q = self._query()
+            name = self._project_arg(q)
+            out = self._style_mod().summary(self._style_proj(name))
+            out["ok"] = True
+            out["project"] = name
+            self._json(out)
+
+        def api_style_impact(self):
+            """
+            GET /api/style/impact?project=&preset=&sentence=：改风格的影响清单。
+
+            不带 preset/sentence 时算的是"按现状"，带则是"改成这个会怎样" ——
+            界面在用户还没点保存之前就能把代价摊开。
+            """
+            q = self._query()
+            name = self._project_arg(q)
+            preset = (q.get("preset") or "").strip() or None
+            sentence = q.get("sentence")
+            out = self._style_mod().style_impact(
+                self._style_proj(name), preset=preset,
+                sentence=None if sentence is None else str(sentence))
+            out["ok"] = True
+            out["project"] = name
+            self._json(out)
+
+        def api_style_set(self, body: dict):
+            """POST /api/style/set：人工定风格（会置 confirmed，之后自动推荐不再覆盖）。"""
+            name = str(body.get("project") or default_project or "")
+            if not name:
+                raise _Abort(400, "no_project", "请求里必须带 project")
+            preset = body.get("preset")
+            sentence = body.get("sentence")
+            if preset is None and sentence is None:
+                raise _Abort(400, "bad_request", "preset 与 sentence 至少给一个")
+            doc = self._style_mod().set_style(
+                self._style_proj(name),
+                preset=None if preset is None else str(preset),
+                sentence=None if sentence is None else str(sentence),
+                source="user", log=_web_log)
+            self._json({"ok": True, "style": doc, "impact": self._style_mod().style_impact(
+                self._style_proj(name)), "message": "风格已保存（已标记为人工确认）"})
+
+        def api_style_recommend(self, body: dict):
+            """POST /api/style/recommend：让 LLM 读整本重推一次（要 force 才覆盖人工确认）。"""
+            name = str(body.get("project") or default_project or "")
+            if not name:
+                raise _Abort(400, "no_project", "请求里必须带 project")
+            proj = self._style_proj(name)
+            cfg = taskctl.load_params(name, projects_root)
+            try:
+                doc = self._style_mod().recommend(proj, cfg, _web_log,
+                                                  force=bool(body.get("force")))
+            except Exception as e:
+                raise _Abort(400, "recommend_failed", f"风格推荐失败：{e}") from e
+            self._json({"ok": True, "style": doc, "skipped": bool(doc.get("skipped")),
+                        "message": ("风格已由人工确认，未重推（要重推请点「覆盖人工确认」）"
+                                    if doc.get("skipped") else "已按整本内容重新推荐风格")})
+
+        def api_style_regen(self, body: dict):
+            """
+            POST /api/style/regen：按新风格**重出受影响的图**（定妆 / 概念图 / 分镜图）。
+
+            ★ 只重出图，**不重跑拆镜** —— 后者会重写全部镜头表并触发全片重渲
+            （实测 52 镜约 36 分钟 GPU），那是另一个决定，必须用户自己在顶栏点。
+            走作业队列（入队即返回），因为这是"十几张图、每张几十秒"的典型场景。
+            """
+            name = str(body.get("project") or default_project or "")
+            if not name:
+                raise _Abort(400, "no_project", "请求里必须带 project")
+            proj = self._style_proj(name)
+            impact = self._style_mod().style_impact(proj)
+            want = body.get("what") or ["portraits", "assets"]
+            want = [str(w) for w in want] if isinstance(want, list) else [str(want)]
+            jobs: list[dict] = []
+            if "portraits" in want:
+                for nm in impact["images"]["portraits"]["names"]:
+                    jobs.append({"kind": "chars_gacha", "args": {"name": nm,
+                                                                 "n": int(body.get("n") or 2)}})
+            if "assets" in want:
+                from vm import assets as _A
+                for key in impact["images"]["assets"]["keys"]:
+                    kind, _sep, aid = key.partition(":")
+                    jobs.append({"kind": "asset_gen", "args": {"kind": kind, "id": aid,
+                                                               "n": int(body.get("n") or 2)}})
+            if "storyboard" in want:
+                # args 形状按 queue.JOB_KINDS["storyboard"] 声明的 ("id","n") 来：
+                # id="all" 由 drain 解释成"全部镜头"（不是某个镜头号）。
+                jobs.append({"kind": "storyboard", "args": {"id": "all"}})
+            if not jobs:
+                self._json({"ok": True, "queued": 0, "jobs": [],
+                            "message": "没有需要重出的图（受影响的图为 0）"})
+                return
+            from vm import queue as Q
+            added = []
+            for j in jobs:
+                try:
+                    job = Q.add(proj, j["kind"], j["args"])
+                    added.append({"id": job.id, "kind": job.kind, "args": job.args})
+                except Exception as e:
+                    raise _Abort(400, "queue_failed", f"入队失败：{e}") from e
+            self._json({"ok": True, "queued": len(added), "jobs": added,
+                        "message": f"已入队 {len(added)} 个重出作业"
+                                   "（镜头表不受影响；要新风格进到镜头需自行重跑「拆镜」）"})
+
+        # ── P3 实体总表 ──────────────────────────────────────────────────
+        def api_entities(self):
+            """GET /api/entities：角色/场景/道具全景 + 各自出现在哪些章。"""
+            q = self._query()
+            name = self._project_arg(q)
+            try:
+                self._json(_proj_mod().entity_registry(name, projects_root))
+            except taskctl.TaskError as e:
+                raise _Abort(400, "bad_request", str(e)) from e
+
+        def api_entities_chapter(self):
+            """GET /api/entities/chapter?project=&no=：某一章用到的实体（按章视图）。"""
+            q = self._query()
+            name = self._project_arg(q)
+            no = (q.get("no") or "").strip()
+            if not no.isdigit():
+                raise _Abort(400, "bad_no", "no 必须是章号（整数）")
+            try:
+                self._json(_proj_mod().split_chapter_entities(name, int(no), projects_root))
+            except taskctl.TaskError as e:
+                raise _Abort(400, "bad_request", str(e)) from e
+
+        def api_entities_merge(self, body: dict):
+            """
+            POST /api/entities/merge：把两个场景实体合成一个（P3.1 的救济口）。
+
+            ★ 会同时改镜头表里的 `scene_id`（那是外键）—— 只删记录会让所有引用它的
+            镜头指向不存在的场景。因此受影响镜头会变 stale，返回体里必须说清数量。
+            """
+            name = str(body.get("project") or default_project or "")
+            if not name:
+                raise _Abort(400, "no_project", "请求里必须带 project")
+            keep = str(body.get("keep") or "").strip()
+            drop = str(body.get("drop") or "").strip()
+            if not keep or not drop:
+                raise _Abort(400, "bad_ids", "需要 keep 与 drop 两个场景 id")
+            try:
+                self._json(_proj_mod().merge_scenes(name, keep, drop, projects_root))
+            except taskctl.TaskError as e:
+                raise _Abort(400, "bad_request", str(e)) from e
+
+        def api_entities_portrait(self, body: dict):
+            """
+            POST /api/entities/portrait：为某角色出**某一章的专属定妆照**（P3.2 的界面入口）。
+
+            走作业队列而不是同步等 —— 出图是几十秒级，而用户通常要给好几个角色
+            连着出第 2 章、第 5 章的换装造型。
+            """
+            name = str(body.get("project") or default_project or "")
+            if not name:
+                raise _Abort(400, "no_project", "请求里必须带 project")
+            char = str(body.get("name") or "").strip()
+            if not char:
+                raise _Abort(400, "bad_name", "必须给角色名 name")
+            if not taskctl.CHAR_NAME_RE.match(char):
+                raise _Abort(400, "bad_name", f"非法角色名：{char!r}")
+            ch = body.get("chapter")
+            if ch is None or str(ch).strip() == "":
+                raise _Abort(400, "bad_chapter",
+                             "chapter 必填：这一支就是「出某章的专属造型」，默认图走 chars/gacha")
+            try:
+                ch = int(ch)
+            except (TypeError, ValueError):
+                raise _Abort(400, "bad_chapter", "chapter 必须是章号（整数）") from None
+            if ch <= 0:
+                raise _Abort(400, "bad_chapter", "chapter 必须是正整数章号")
+            from vm import costumes as _cs
+            from vm.state import Project
+
+            proj = Project(taskctl.resolve_project(name, projects_root))
+            if not _cs.variants_of_chapter(_cs.load(proj), char, ch):
+                raise _Abort(400, "no_variant",
+                             f"「{char}」在第 {ch} 章没有登记专属造型，出了一张也和默认图一样。"
+                             f"先在拆镜时让系统检测造型变化，或在服装面板里手工加一个带章号的变体。")
+            try:
+                n = int(body.get("n") or taskctl.DEFAULT_GACHA_COUNT)
+            except (TypeError, ValueError):
+                raise _Abort(400, "bad_count", "张数 n 必须是整数") from None
+            if not 1 <= n <= 24:
+                raise _Abort(400, "bad_count", f"抽卡张数要在 1~24 之间，收到 {n}")
+            from vm import queue as Q
+
+            try:
+                job = Q.add(proj, "chars_gacha", {"name": char, "n": n, "chapter": ch})
+            except Exception as e:
+                raise _Abort(400, "queue_failed", f"入队失败：{e}") from e
+            self._json({"ok": True, "queued": 1, "job_id": job.id,
+                        "product": f"refs/char_{char}@ch{ch:02d}.png",
+                        "message": f"已入队：{char} 第 {ch} 章专属造型 × {n} 张"})
+
+        def api_chapter_trash(self):
+            """GET /api/chapter/trash：被删章节的可恢复清单（删除是可逆的，得能看见）。"""
+            q = self._query()
+            name = self._project_arg(q)
+            out = _proj_mod().list_trash(name, projects_root)
+            out["ok"] = True
+            self._json(out)
+
+        def api_chapter_save(self, body: dict):
+            """POST /api/chapter/save：新建或改写一章正文（手动输入这条路的落点）。"""
+            name = str(body.get("project") or default_project or "")
+            if not name:
+                raise _Abort(400, "no_project", "请求里必须带 project")
+            no = body.get("no")
+            if no not in (None, "") and not str(no).strip().isdigit():
+                raise _Abort(400, "bad_no", "no 要给章号（整数）或留空表示新建")
+            try:
+                self._json(_proj_mod().save_chapter(
+                    name, no=int(no) if no not in (None, "") else None,
+                    title=str(body.get("title") or ""), text=str(body.get("text") or ""),
+                    root=projects_root))
+            except taskctl.TaskError as e:
+                raise _Abort(400, "bad_request", str(e)) from e
+
+        def api_chapter_import(self, body: dict):
+            """POST /api/chapter/import：批量导入章节 `files:[{filename,text,overwrite?}]`。"""
+            name = str(body.get("project") or default_project or "")
+            if not name:
+                raise _Abort(400, "no_project", "请求里必须带 project")
+            files = body.get("files")
+            if not isinstance(files, list) or not files:
+                raise _Abort(400, "bad_files", "files 必须是非空数组：[{filename, text}]")
+            clean = []
+            for f in files:
+                if not isinstance(f, dict):
+                    raise _Abort(400, "bad_files", "files 的每一项都必须是对象")
+                clean.append({"filename": str(f.get("filename") or ""),
+                              "text": str(f.get("text") or ""),
+                              "overwrite": bool(f.get("overwrite"))})
+            try:
+                self._json(_proj_mod().import_chapters(name, clean, root=projects_root))
+            except taskctl.TaskError as e:
+                raise _Abort(400, "bad_request", str(e)) from e
+
+        def _chapter_no_from(self, body: dict) -> int:
+            no = body.get("no")
+            if no is None or not str(no).strip().isdigit():
+                raise _Abort(400, "bad_no", "no 必须是章号（整数）")
+            return int(no)
+
+        def api_chapter_delete(self, body: dict):
+            """POST /api/chapter/delete：删一章（正文与镜头表移到 _trash/，**不真删**）。"""
+            name = str(body.get("project") or default_project or "")
+            if not name:
+                raise _Abort(400, "no_project", "请求里必须带 project")
+            try:
+                self._json(_proj_mod().delete_chapter(name, self._chapter_no_from(body), projects_root))
+            except taskctl.TaskError as e:
+                raise _Abort(400, "bad_request", str(e)) from e
+
+        def api_chapter_rename(self, body: dict):
+            """POST /api/chapter/rename：改章节标题。章号不变（它是镜头 id 前缀与集数的主键）。"""
+            name = str(body.get("project") or default_project or "")
+            if not name:
+                raise _Abort(400, "no_project", "请求里必须带 project")
+            try:
+                self._json(_proj_mod().rename_chapter(
+                    name, self._chapter_no_from(body), str(body.get("title") or ""), projects_root))
+            except taskctl.TaskError as e:
+                raise _Abort(400, "bad_request", str(e)) from e
+
+        def api_chapter_reorder(self, body: dict):
+            """POST /api/chapter/reorder：重排章节顺序。只动顺序、不动任何章号。"""
+            name = str(body.get("project") or default_project or "")
+            if not name:
+                raise _Abort(400, "no_project", "请求里必须带 project")
+            order = body.get("order")
+            if not isinstance(order, list) or not order:
+                raise _Abort(400, "bad_order", "order 必须是章号数组（给出全部章）")
+            try:
+                self._json(_proj_mod().reorder_chapters(name, order, projects_root))
+            except taskctl.TaskError as e:
+                raise _Abort(400, "bad_request", str(e)) from e
 
         def api_storyboard(self):
             """GET /api/storyboard：分镜图（渲染前审片）逐镜状态。"""
@@ -1213,6 +1669,13 @@ def make_handler(projects_root: Path, default_project: str | None = None):
 
         def view(self):
             q = self._query()
+            # 兼容旧地址形态：/view?...&kind=final&file=EP01.mp4
+            # 2026-09-28 之前 /api/status 的 finals[].url 就是这个样子；外部脚本、书签、
+            # 旧版前端可能还在用。规范形态是 final=1&episode=EP01（见 taskctl finals 表）。
+            if not q.get("final") and q.get("kind") == "final" and q.get("file"):
+                q = {**q, "final": "1", "episode": Path(str(q["file"])).stem}
+                q.pop("kind", None)
+                q.pop("file", None)
             name = self._project_arg(q)
             pdir = taskctl.resolve_project(name, projects_root)
             proj = Project(pdir)
@@ -1300,7 +1763,19 @@ def make_handler(projects_root: Path, default_project: str | None = None):
             if not 1 <= n <= 24:
                 raise _Abort(400, "bad_count", f"抽卡张数要在 1~24 之间，收到 {n}")
             # 走统一任务模型：进度/日志/停止/并发锁与 render 完全一样
-            self._json(self._start({"project": name, "stage": "gacha", "count": n}, only=[char], force=False))
+            ch = body.get("chapter")
+            if ch not in (None, "", 0):
+                try:
+                    ch = int(ch)
+                except (TypeError, ValueError):
+                    raise _Abort(400, "bad_chapter", "chapter 必须是章号（整数）") from None
+                if ch <= 0:
+                    raise _Abort(400, "bad_chapter", "chapter 必须是正整数章号")
+            else:
+                ch = None
+            # 走统一任务模型：进度/日志/停止/并发锁与 render 完全一样
+            self._json(self._start({"project": name, "stage": "gacha", "count": n,
+                                    "chapter": ch}, only=[char], force=False))
 
         def api_chars_adopt(self, body: dict):
             name = str(body.get("project") or default_project or "")
@@ -1328,10 +1803,7 @@ def make_handler(projects_root: Path, default_project: str | None = None):
             safe = re.sub(r"[^A-Za-z0-9_.\-]", "_", Path(filename).name)[-60:] or "upload"
             dst = Project(pdir).state_dir / "uploads" / f"{char}_{int(time.time())}_{safe}"
             dst.parent.mkdir(parents=True, exist_ok=True)
-            tmp = dst.with_suffix(dst.suffix + ".tmp")
-            with open(tmp, "wb") as f:
-                f.write(raw)
-            os.replace(tmp, dst)
+            fsutil.write_bytes(dst, raw)
             self._json(self._apply_ref(name, char, dst, f"上传自有图 {safe}（{len(raw)/1024:.0f} KB）"))
 
         def api_chars_prompt(self, body: dict):
@@ -1426,6 +1898,22 @@ def make_handler(projects_root: Path, default_project: str | None = None):
                 count = int(body.get("count") or 0)
             except (TypeError, ValueError):
                 raise _Abort(400, "bad_count", "count 必须是整数") from None
+            # P0.3：单章增量拆镜。以前 Web 侧根本没有这个入口 —— 改了/新加一章，
+            # 点「拆镜」会把**全部**章节重跑一遍 LLM。
+            chapter_v = body.get("chapter")
+            if chapter_v not in (None, "", 0):
+                try:
+                    chapter_v = int(chapter_v)
+                except (TypeError, ValueError):
+                    raise _Abort(400, "bad_chapter", "chapter 必须是章号（整数）") from None
+            else:
+                chapter_v = None
+            # P3.2：chapter 现在对 chars / gacha 也有意义 —— 在那里它表示
+            # 「出这一章的专属造型图」，不是「只拆这一章」。同一个整数、两种语义，
+            # 界面上是两个不同动作：「只重拆这一章」与「出第 N 章的换装定妆」。
+            if chapter_v is not None and stage not in ("plan", "chars", "gacha"):
+                raise _Abort(400, "bad_chapter",
+                             f"chapter 只对 plan/chars/gacha 有意义，收到 stage={stage!r}")
             try:
                 h = taskctl.start_async(
                     name,
@@ -1435,6 +1923,7 @@ def make_handler(projects_root: Path, default_project: str | None = None):
                     dry=bool(body.get("dry")),
                     fake_sleep=fake_sleep,
                     count=count,
+                    chapter=chapter_v,
                     root=projects_root,
                 )
             except taskctl.NeedsApproval as e:

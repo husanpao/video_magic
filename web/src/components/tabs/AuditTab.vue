@@ -165,7 +165,7 @@
  *   把 finding 的 `rewrite_hint` 直接当 feedback 交给 api.rewriteShot（AI 重写），
  *   "看到问题 → 修问题"不再跨 tab 找镜头。
  */
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { ElButton, ElCollapse, ElCollapseItem, ElMessage, ElTag } from 'element-plus'
 import type { AuditFinding } from '@/api/types'
 import { api } from '@/api/client'
@@ -255,6 +255,15 @@ onMounted(() => {
   void load()
   void refreshCompleteness()
 })
+
+/**
+ * ★ 项目到位后**必须补拉一次完备性矩阵**。
+ * 子组件的 onMounted 跑在 `App.vue` 的 `loadProjects()` 之前，那一刻 `state.project`
+ * 还是空串，`refreshCompleteness()` 直接 return（它的第一行就是 `if (!state.project) return`）。
+ * 在工作台里这事看不出来：tab 是 `lazy` 的，用户点到时项目早就有了；
+ * 而 W4 审片屏把这张卡**常驻挂载**，于是矩阵永远停在"加载中…"（真浏览器截图抓到的）。
+ */
+watch(() => state.project, (p) => { if (p) void refreshCompleteness() })
 
 // ── B3 完备性矩阵 ──
 const cm = computed(() => state.completeness)

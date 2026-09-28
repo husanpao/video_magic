@@ -1,8 +1,9 @@
 import type {
   AuditResponse, CharsResponse, LogResponse, ProjectSummary, ProjectsResponse,
   PropsResponse, QcResponse, ScenesResponse, ShotDetailResponse, ShotsResponse,
-  AssetsResponse, ChaptersResponse, CompletenessResponse, QueueResponse, ResetPreview,
-  ScriptResponse, Stage, StatusResponse, StoryboardResponse,
+  AssetsResponse, ChaptersResponse, ChapterDetail, ChapterMutationResult, ChapterTrash,
+  CompletenessResponse, CreateProjectResult, ProjectMeta, ProjectDeleteResult, ProjectTrashResponse, QueueResponse, ResetPreview,
+  EntitiesResponse, ScriptResponse, Stage, StatusResponse, StoryboardResponse, StyleImpact, StyleInfo,
 } from './types'
 
 /**
@@ -149,7 +150,11 @@ export const api = {
   rerenderBulk: (project: string, ids: string[]) =>
     post<RunResult>('/api/run', { project, stage: 'render', force: true, only: ids }),
 
-  run: (project: string, stage: Stage, opts: { force?: boolean; dry?: boolean; only?: string[] } = {}) =>
+  /** 启动一个阶段。
+   *  `chapter`（仅 plan 有意义）= **只拆那一章**：P0.3 之前 `--chapter` 是死参数，
+   *  改了或新加一章要把全部章节重跑一遍 LLM。现在前端要能把这个能力点出来，
+   *  否则后台修好了也等于没修。 */
+  run: (project: string, stage: Stage, opts: { force?: boolean; dry?: boolean; only?: string[]; chapter?: number } = {}) =>
     post<RunResult>('/api/run', { project, stage, ...opts }),
 
   stop: (project: string) => post<SimpleResult>('/api/stop', { project }),
@@ -200,7 +205,6 @@ export const api = {
   charUpload: (project: string, name: string, filename: string, b64: string) =>
     post<SimpleResult>('/api/chars/upload', { project, name, filename, b64 }),
   storyboard: (project: string) => request<StoryboardResponse>(`/api/storyboard${q({ project })}`),
-  chapters: (project: string) => request<ChaptersResponse>(`/api/chapters${q({ project })}`),
   script: (project: string) => request<ScriptResponse>(`/api/script${q({ project })}`),
   completeness: (project: string) => request<CompletenessResponse>(`/api/completeness${q({ project })}`),
 
@@ -211,6 +215,85 @@ export const api = {
     post<RunResult>('/api/chars/gacha', { project, name, n }),
   adopt: (project: string, name: string, file: string) =>
     post<SimpleResult>('/api/chars/adopt', { project, name, file }),
+
+  /* ── P1 前门：项目与章节管理 ─────────────────────────────────────────
+     业务全在后台 `vm/proj.py`，这里只是薄薄一层调用（CLI/Web 同一套控制层）。 */
+  projectMeta: (project: string) =>
+    request<ProjectMeta>(`/api/project/meta${q({ project })}`),
+  createProject: (payload: { name: string; title?: string; source_type?: string;
+                             logline?: string; style_preset?: string }) =>
+    post<CreateProjectResult>('/api/project/create', payload),
+  updateProject: (project: string, patch: Partial<ProjectMeta>) =>
+    post<{ ok: boolean; changed: string[]; meta: ProjectMeta; message: string }>(
+      '/api/project/update', { project, patch }),
+
+  /**
+   * 删除项目 = **移进 projects/_trash/**，不是 rm。
+   * `confirm` 必须逐字等于项目名（后端还会再校验一遍，这里只是把话带到界面上）。
+   */
+  deleteProject: (project: string, confirm: string) =>
+    post<ProjectDeleteResult>('/api/project/delete', { project, confirm }),
+  /** 回收站里有哪些被删掉的项目（可逆性要能被看见） */
+  projectTrash: () => request<ProjectTrashResponse>('/api/project/trash'),
+  /** 放回一个项目。重名会被后端拒绝（不覆盖用户内容）。 */
+  restoreProject: (entry: string) =>
+    post<{ ok: boolean; project: string; path: string; message: string }>(
+      '/api/project/restore', { entry }),
+
+  /** 章节清单。`detail=0` 退回旧的精简形状（界面默认要 detail，才有 needs_replan/next_step）。 */
+  chapters: (project: string, detail = true) =>
+    request<ChaptersResponse>(`/api/chapters${q({ project, detail: detail ? undefined : '0' })}`),
+  chapter: (project: string, no: number) =>
+    request<ChapterDetail>(`/api/chapter${q({ project, no })}`),
+  /** 新建（不传 no）或改写（传 no）一章正文。 */
+  chapterSave: (project: string, payload: { no?: number; title?: string; text: string }) =>
+    post<ChapterMutationResult>('/api/chapter/save', { project, ...payload }),
+  chapterImport: (project: string, files: Array<{ filename: string; text: string; overwrite?: boolean }>) =>
+    post<ChapterMutationResult>('/api/chapter/import', { project, files }),
+  /** 删除是**可逆**的：正文与镜头表进 `novel/_trash/`，不真删。 */
+  chapterDelete: (project: string, no: number) =>
+    post<ChapterMutationResult>('/api/chapter/delete', { project, no }),
+  chapterRename: (project: string, no: number, title: string) =>
+    post<ChapterMutationResult>('/api/chapter/rename', { project, no, title }),
+  /** 重排只动顺序、不动章号（章号是镜头 id 前缀与成片集数的主键）。 */
+  chapterReorder: (project: string, order: number[]) =>
+    post<ChapterMutationResult>('/api/chapter/reorder', { project, order }),
+  chapterTrash: (project: string) =>
+    request<ChapterTrash>(`/api/chapter/trash${q({ project })}`),
+
+  /* ── P2 风格层 ─────────────────────────────────────────────────────── */
+  style: (project: string) => request<StyleInfo>(`/api/style${q({ project })}`),
+  /** 影响清单：不带参数=按现状；带 preset/sentence=「改成这样会怎样」 */
+  styleImpact: (project: string, to: { preset?: string; sentence?: string } = {}) =>
+    request<StyleImpact>(`/api/style/impact${q({ project, ...to })}`),
+  styleSet: (project: string, payload: { preset?: string; sentence?: string }) =>
+    post<{ ok: boolean; style: StyleInfo; impact: StyleImpact; message: string }>(
+      '/api/style/set', { project, ...payload }),
+  /** 让 LLM 读整本重推。已人工确认时要 force 才会覆盖。 */
+  styleRecommend: (project: string, force = false) =>
+    post<{ ok: boolean; style: StyleInfo; skipped: boolean; message: string }>(
+      '/api/style/recommend', { project, force }),
+  /** 按新风格重出受影响的图（入队；不重跑拆镜、不触发镜头重渲） */
+  styleRegen: (project: string, opts: { what?: string[]; n?: number } = {}) =>
+    post<{ ok: boolean; queued: number; message: string }>(
+      '/api/style/regen', { project, ...opts }),
+
+  /* ── P3 实体总表 ───────────────────────────────────────────────────── */
+  entities: (project: string) => request<EntitiesResponse>(`/api/entities${q({ project })}`),
+  entitiesChapter: (project: string, no: number) =>
+    request<{ ok: boolean; chapter: number; shots: number; characters: string[];
+              scenes: Array<{ id: string; name: string }>;
+              props: Array<{ id: string; name: string }>; }>(
+      `/api/entities/chapter${q({ project, no })}`),
+  /** 合并场景：**同时改镜头表里的 scene_id 外键**，受影响镜头会变 stale */
+  entityMerge: (project: string, payload: { keep: string; drop: string }) =>
+    post<{ ok: boolean; kept: string; dropped: string; repointed_shots: number;
+           message: string; hint: string; backup: string }>(
+      '/api/entities/merge', { project, ...payload }),
+  /** 出某角色的**章节专属定妆照**（入队；该章须已登记造型变体） */
+  entityPortrait: (project: string, payload: { name: string; chapter: number; n?: number }) =>
+    post<{ ok: boolean; queued: number; job_id: string; product: string; message: string }>(
+      '/api/entities/portrait', { project, ...payload }),
 
   thumbUrl: (project: string, shotId: string, mtime = 0) =>
     `/view${q({ project, shot: shotId, thumb: 1, t: mtime })}`,
