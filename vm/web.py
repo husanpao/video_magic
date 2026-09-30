@@ -1979,6 +1979,24 @@ def make_handler(projects_root: Path, default_project: str | None = None):
 # ---------------------------------------------------------------- 入口
 
 
+def _lan_ip() -> str:
+    """
+    本机在局域网里的地址（给"手机/别的电脑怎么打开控制台"用）。
+
+    用 UDP "连"一个外部地址取本地出口 IP —— **不会真的发包**，也不需要外网通。
+    取不到就返回空串（只打印本机地址，不报错）。
+    """
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return str(s.getsockname()[0])
+    except OSError:
+        return ""
+    finally:
+        s.close()
+
+
 def serve(proj_root: Path, port: int = 8801, *, default_project: str | None = None, host: str = "127.0.0.1") -> None:
     """
     proj_root 传 projects/ 目录（含各项目子目录）。
@@ -1994,6 +2012,13 @@ def serve(proj_root: Path, port: int = 8801, *, default_project: str | None = No
     httpd.daemon_threads = True
     names = taskctl.discover_projects(root)
     print(f"[web] 漫剧流水线 Web UI：http://{host}:{port}/", flush=True)
+    # 绑 0.0.0.0 时给一条"手机/别的电脑怎么打开"的地址，并明确提示无鉴权
+    if host in ("0.0.0.0", "::", ""):
+        lan = _lan_ip()
+        if lan:
+            print(f"[web] 局域网访问：http://{lan}:{port}/  （手机/别的电脑用这个）", flush=True)
+        print("[web] ⚠️ 监听全部网卡且**没有鉴权** —— 同网段的人都能打开这个控制台"
+              "（能提交渲染）。只想本机用请加 --host 127.0.0.1。", flush=True)
     print(f"[web] 项目根目录：{root}", flush=True)
     print(f"[web] 项目：{', '.join(names) if names else '（无）'}", flush=True)
     print("[web] 只读+提交：不会启停 ComfyUI，也不会动 /home/max/ComfyUI/output/", flush=True)

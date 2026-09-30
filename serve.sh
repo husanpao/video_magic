@@ -11,7 +11,7 @@
 # 得再 `./serve.sh start`。（今天就是这样：手动起的两个服务隔了一晚都不在了，
 # 而 `status` 一眼能看出来 —— 这就是它当默认动作的原因。）
 #
-# 环境变量：VM_PORT=8801  VM_LOG=$REPO/vm-web.log  VM_PYTHON=python3
+# 环境变量：VM_PORT=8801  VM_LOG=$REPO/vm-web.log  VM_PYTHON=python3  VM_HOST=0.0.0.0
 #           VM_READY_TIMEOUT=40  VM_STOP_TIMEOUT=15
 #
 # 注意：`start` 起的总是**真实 projects/** 上的控制台。夹具服务器
@@ -29,6 +29,27 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PORT="${VM_PORT:-8801}"
+
+# 监听地址提示：VM_HOST=0.0.0.0（默认）时同时报出局域网地址，
+# 因为"手机怎么打开"是实际使用中最常问的一句；绑 127.0.0.1 就只报本机。
+_addr_report() {
+  local port="$1" host="${VM_HOST:-0.0.0.0}" lan=""
+  echo "  地址  http://127.0.0.1:$port/"
+  if [ "$host" = "0.0.0.0" ]; then
+    lan="$(python3 - <<'EOF' 2>/dev/null || true
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+try:
+    s.connect(("8.8.8.8", 80)); print(s.getsockname()[0])
+except OSError:
+    pass
+finally:
+    s.close()
+EOF
+)"
+    [ -n "$lan" ] && echo "         http://$lan:$port/   （局域网/手机）"
+  fi
+}
 LOG="${VM_LOG:-$REPO/vm-web.log}"
 PY="${VM_PYTHON:-python3}"
 READY_TIMEOUT="${VM_READY_TIMEOUT:-40}"
@@ -111,7 +132,7 @@ do_start() {
   cd "$REPO"
   local -a argv=("$PY" -u pipeline.py)
   [ -n "$proj" ] && argv+=("$proj")
-  argv+=(--serve --port "$PORT")
+  argv+=(--serve --port "$PORT" --host "${VM_HOST:-0.0.0.0}")
   # setsid：脱离本脚本的会话，脚本退出后服务不被连带带走；nohup + 追加日志：可查。
   setsid nohup "${argv[@]}" >> "$LOG" 2>&1 &
 
@@ -124,7 +145,8 @@ do_start() {
   fi
   pid="$(listener_pid)"
   echo "✓ 已启动：pid=${pid:-?}  端口=$PORT  默认项目=${proj:-（由服务自选）}"
-  echo "  地址  http://127.0.0.1:$PORT/"
+  _addr_report "$PORT"
+
   echo "  日志  $LOG"
 }
 
@@ -170,7 +192,7 @@ do_status() {
   up="$(http_status /api/projects)"
   echo "  HTTP /api/projects → $up"
   if [ "$up" = "200" ]; then
-    echo "  地址 http://127.0.0.1:$PORT/"
+    _addr_report "$PORT"
     # 默认选中哪个项目：由启动时的 project 参数决定，没传则由服务自选
     def="$(curl -s --max-time 5 "http://127.0.0.1:$PORT/api/projects" \
       | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d.get("default") or "（未设）")' 2>/dev/null || true)"

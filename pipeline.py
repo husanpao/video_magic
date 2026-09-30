@@ -596,7 +596,7 @@ def cmd_new(args) -> int:
     return 0
 
 
-def cmd_serve(project: str | None, port: int) -> int:
+def cmd_serve(project: str | None, port: int, host: str = "0.0.0.0") -> int:
     from vm import web
 
     root = taskctl.PROJECTS_DIR
@@ -609,7 +609,7 @@ def cmd_serve(project: str | None, port: int) -> int:
             print(f"✗ 项目不存在：{pdir}", file=sys.stderr)
             return 2
         print(f"[pipeline] 注意：Web UI 管理 projects/ 下的全部项目，默认选中「{pdir.name}」")
-    web.serve(root, port, default_project=(Path(project).name if project else None))
+    web.serve(root, port, default_project=(Path(project).name if project else None), host=host)
     return 0
 
 
@@ -650,6 +650,9 @@ def build_parser() -> argparse.ArgumentParser:
                    metavar="标题=正文文件", help="配合 --new：直接导入章节文件，可重复")
     p.add_argument("--serve", action="store_true", help="启动极简 Web UI")
     p.add_argument("--port", type=int, default=8801, help="Web UI 端口（默认 8801）")
+    p.add_argument("--host", default="0.0.0.0",
+                   help="Web UI 监听地址（默认 0.0.0.0 = 局域网可访问，与 ComfyUI 一致；"
+                        "只想本机用就填 127.0.0.1）")
     # 内部参数：由 taskctl 派生 worker 时使用；正常用户不需要碰
     p.add_argument("--_worker", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--_fake-sleep", dest="_fake_sleep", type=float, default=0.0, help=argparse.SUPPRESS)
@@ -677,7 +680,7 @@ def main(argv: list[str] | None = None) -> int:
         return worker_main(args)
 
     if args.serve:
-        return cmd_serve(args.project, args.port)
+        return cmd_serve(args.project, args.port, args.host)
 
     if not args.project:
         build_parser().print_help()

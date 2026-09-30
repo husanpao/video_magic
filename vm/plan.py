@@ -173,6 +173,40 @@ DEFAULT_PORTRAIT_BACKGROUND = (
     "Camera slowly pushes in. Ambient audio: quiet room tone, no dialogue."
 )
 
+# ★ 定妆图是**全片的地基**（资产先行）。2026-09-28 实测发现拼出来的定妆提示词
+#   自相矛盾，直接导致"整体差"：
+#     ① 硬编码的 "medium close-up portrait" 与角色卡里的 "framed full body" 同时存在
+#        → 6 张定妆照景别混乱（半身/全身混着），跨镜必然飘；
+#     ② 影棚句 "soft even lighting" 与风格句 "directional moonlight with deep shadows"
+#        同时存在 → 脸埋在阴影里，整片发暗发灰。
+#   所以这里**主动清掉**互相打架的分句，并把构图/光位固定成"脸要清晰可读"。
+#   顺带也治 H3 的另一个已知短板：头在画面里越小，脸越崩（见 ComfyUI-H3-FaceRefine）。
+_PORTRAIT_FRAMING_BAN = re.compile(
+    r"(?i)\b(?:framed\s+)?(?:full[\s-]?body|full[\s-]?length|whole[\s-]?body|head[\s-]?to[\s-]?toe)\b[^,.;]*[,.;]?"
+)
+_PORTRAIT_LIGHT_BAN = re.compile(
+    r"(?i)[^,.;]*\b(?:deep shadows?|heavy shadows?|hard shadows?|harsh shadows?|strong shadows?|"
+    r"directional moonlight|chiaroscuro|low[\s-]?key)\b[^,.;]*[,.;]?"
+)
+_PORTRAIT_MOTION_BAN = re.compile(
+    r"(?i)[^.]*\b(?:camera\s+(?:slowly\s+)?(?:pushes?|moves?|dollies|tracks)|ambient audio|"
+    r"room tone|no dialogue)\b[^.]*\.?"
+)
+PORTRAIT_BACKGROUND = (
+    "Background: a plain neutral studio backdrop drawn from the film's own colour palette, "
+    "lit by a soft even frontal key with a gentle rim so the whole face and the costume are "
+    "clearly readable; no light direction that hides the face. "
+    "Static frame, no camera movement, no audio."
+)
+
+
+def _portrait_clean(text: str, *patterns: re.Pattern[str]) -> str:
+    """把定妆提示词里互相打架的分句清掉（见上面 ①②的成因）。"""
+    out = text or ""
+    for p in patterns:
+        out = p.sub(" ", out)
+    return re.sub(r"\s{2,}", " ", out).strip(" ,.;")
+
 # 拆镜表分块：一次请求塞太多正文会让输出被 max_tokens 截断（表现为 JSON 半截）。
 CHUNK_CHARS = 2600
 
@@ -549,16 +583,20 @@ def _build_portrait_prompt(name: str, appearance: str, costume: str, style: str,
         who = f"a character named {name}"
     else:
         who = "the character"
-    desc = appearance.strip().rstrip(".")
+    desc = _portrait_clean(appearance, _PORTRAIT_FRAMING_BAN)
     if costume.strip():
         desc = f"{desc}. {costume.strip().rstrip('.')}"
     # 兜底值随预设走 —— 否则 anime 项目里定妆卡仍会得到写实背景句
     _pre = _style.get(preset) if preset else _style.get(_style.DEFAULT_PRESET)
-    style = (style or _pre["sentence"]).strip().rstrip(".")
-    bg = (background or _pre["portrait_background"]).strip()
+    # 风格句保留（配色/质感要一致），但**清掉压暗脸的光位分句**
+    style = _portrait_clean(style or _pre["sentence"], _PORTRAIT_LIGHT_BAN)
+    # 背景：优先用预设的，但同样清掉压暗脸的光位与运镜/声音句；清空了就用定妆专用背景
+    bg = _portrait_clean(background or _pre["portrait_background"],
+                         _PORTRAIT_LIGHT_BAN, _PORTRAIT_MOTION_BAN) or PORTRAIT_BACKGROUND
     return (
         f"{FL2VA_MAIN}: [Shot 1] Cinematic medium close-up portrait of {who}, "
-        f"standing still and facing the camera directly. {desc}. {bg} {style}."
+        f"head and shoulders filling the frame, facing the camera directly, eyes open and "
+        f"clearly visible, neutral relaxed expression. {desc}. {bg}. {style}."
     )
 
 
